@@ -43,7 +43,7 @@ def _load_cookies_for_user(user_id: int) -> Optional[str]:
     
     # Пробуем глобальные куки
     try:
-        from CONFIG._config import Config
+        from CONFIG.config import Config  # env-aware (Railway)
         global_cookie_path = Config.COOKIE_FILE_PATH
         if os.path.exists(global_cookie_path):
             # Создаем директорию пользователя и копируем глобальные куки
