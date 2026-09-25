@@ -13,7 +13,7 @@ services:
     container_name: tg-ytdlp-bot
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.vps
       args:
         <<: *default-build-args
     env_file:
@@ -34,7 +34,7 @@ services:
     container_name: tg-ytdlp-dashboard
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.vps
       args:
         <<: *default-build-args
     env_file:
