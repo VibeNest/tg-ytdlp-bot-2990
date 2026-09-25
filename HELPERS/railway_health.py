@@ -53,6 +53,21 @@ def _pid_alive(pid):
         return os.path.exists("/proc/%d" % pid)
 
 
+def _is_mount(path):
+    """آیا روی این مسیر واقعاً یک Volume مانت شده است؟"""
+    if not path:
+        return False
+    try:
+        with open("/proc/mounts", "r") as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == path:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def _disk():
     path = DATA_DIR if (DATA_DIR and os.path.isdir(DATA_DIR)) else "/app"
     try:
@@ -76,7 +91,7 @@ def _payload():
         "botPid": pid or None,
         "uptimeSec": int(time.time() - START_TS),
         "dataDir": DATA_DIR or "(ephemeral)",
-        "volume": bool(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or (DATA_DIR and DATA_DIR != "/app")),
+        "volume": _is_mount(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or DATA_DIR),
         "disk": _disk(),
         "tz": os.environ.get("TZ", "UTC"),
         "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
