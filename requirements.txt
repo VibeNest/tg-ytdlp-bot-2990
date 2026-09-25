@@ -1,0 +1,40 @@
+# Базовые зависимости (обычная установка)
+# pyrogram is outdated; switch to actively maintained PyroTGFork
+pyrotgfork
+aiohttp
+aiofiles
+requests<3,>=2.8.1
+fastapi
+uvicorn[standard]
+jinja2
+python-multipart
+psutil
+TgCrypto-pyrofork
+#TgCrypto>=1.2.5
+moviepy==1.0.3
+tldextract
+pillow
+chardet
+sdnotify
+firebase-admin
+bgutil-ytdlp-pot-provider
+urllib3
+brotlicffi>=1.2.0.0
+
+# Только для yt-dlp — разрешить пре-релизы и переустановить «с нуля»
+--pre
+yt-dlp[default,curl-cffi]
+# curl_cffi для поддержки специфических версий impersonate (chrome122, chrome121 и т.д.)
+curl_cffi>=0.6.0
+# Gallery-dl для скачивания картинок
+gallery-dl
+
+# Зависимости для admin_bot.py
+# Для SOCKS прокси используйте: pip install "python-telegram-bot[socks]"
+# Для обычной установки: pip install python-telegram-bot
+#python-telegram-bot[socks]>=20.0  # Включает поддержку SOCKS прокси
+#python-dateutil
+#paramiko
+#pyrotgfork
+
+#apt-get install sshpass
