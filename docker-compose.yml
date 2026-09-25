@@ -1,13 +1,11 @@
 x-default-build-args: &default-build-args
   TZ: "${TZ}"
-
 x-default-logging: &default-logging
   driver: local
   options:
     max-size: "1G"
     max-file: "1"
     compress: "false"
-
 services:
   bot:
     container_name: tg-ytdlp-bot
@@ -15,113 +13,286 @@ services:
       context: .
       dockerfile: Dockerfile.vps
       args:
-        <<: *default-build-args
-    env_file:
-      - .env
+        TZ: "${TZ}"
     restart: unless-stopped
-    logging: *default-logging
+    logging:
+      driver: local
+      options:
+        max-size: "1G"
+        max-file: "1"
+        compress: "false"
     depends_on:
       bgutil-provider:
         condition: service_started
       warp:
         condition: service_healthy
     volumes:
-      - .:/app
+    - .:/app
     working_dir: /app
     network_mode: "service:warp"
-
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      API_ID: ${API_ID}
+      API_HASH: ${API_HASH}
+      BOT_NAME: ${BOT_NAME}
+      BOT_NAME_FOR_USERS: ${BOT_NAME_FOR_USERS}
+      ADMIN: ${ADMIN}
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
+      LOGS_ID: ${LOGS_ID}
+      LOG_EXCEPTION: ${LOG_EXCEPTION}
+      LOGS_VIDEO_ID: ${LOGS_VIDEO_ID}
+      LOGS_NSFW_ID: ${LOGS_NSFW_ID}
+      LOGS_IMG_ID: ${LOGS_IMG_ID}
+      LOGS_PAID_ID: ${LOGS_PAID_ID}
+      TZ: ${TZ}
+      ADMIN_GROUP: ${ADMIN_GROUP}
+      ALLOWED_GROUP: ${ALLOWED_GROUP}
+      ALLOWED_USERS: ${ALLOWED_USERS}
+      MINIAPP_URL: ${MINIAPP_URL}
+      STAR_RECEIVER: ${STAR_RECEIVER}
+      SUBSCRIBE_CHANNEL: ${SUBSCRIBE_CHANNEL}
+      SUBSCRIBE_CHANNEL_URL: ${SUBSCRIBE_CHANNEL_URL}
+      CHANNEL_GUARD_SESSION_STRING: ${CHANNEL_GUARD_SESSION_STRING}
+      COOKIES_CONTENT: ${COOKIES_CONTENT}
+      YOUTUBE_COOKIES_CONTENT: ${YOUTUBE_COOKIES_CONTENT}
+      COOKIE_URL: ${COOKIE_URL}
+      YOUTUBE_COOKIE_URL: ${YOUTUBE_COOKIE_URL}
+      YOUTUBE_COOKIE_ORDER: ${YOUTUBE_COOKIE_ORDER}
+      INSTAGRAM_COOKIE_URL: ${INSTAGRAM_COOKIE_URL}
+      TIKTOK_COOKIE_URL: ${TIKTOK_COOKIE_URL}
+      TWITTER_COOKIE_URL: ${TWITTER_COOKIE_URL}
+      VK_COOKIE_URL: ${VK_COOKIE_URL}
+      YOUTUBE_POT_ENABLED: ${YOUTUBE_POT_ENABLED}
+      YOUTUBE_POT_BASE_URL: ${YOUTUBE_POT_BASE_URL}
+      YOUTUBE_POT_DISABLE_INNERTUBE: ${YOUTUBE_POT_DISABLE_INNERTUBE}
+      PROXY_TYPE: ${PROXY_TYPE}
+      PROXY_IP: ${PROXY_IP}
+      PROXY_PORT: ${PROXY_PORT}
+      PROXY_USER: ${PROXY_USER}
+      PROXY_PASSWORD: ${PROXY_PASSWORD}
+      PROXY_SELECT: ${PROXY_SELECT}
+      MAX_FILE_SIZE_GB: ${MAX_FILE_SIZE_GB}
+      MAX_CONCURRENT_DOWNLOADS: ${MAX_CONCURRENT_DOWNLOADS}
+      MAX_CONCURRENT_UPLOADS: ${MAX_CONCURRENT_UPLOADS}
+      TG_YTDLP_BG_WORKERS: ${TG_YTDLP_BG_WORKERS}
+      TG_YTDLP_BG_INFLIGHT: ${TG_YTDLP_BG_INFLIGHT}
+      DOWNLOAD_TIMEOUT: ${DOWNLOAD_TIMEOUT}
+      MAX_VIDEO_DURATION: ${MAX_VIDEO_DURATION}
+      MAX_PLAYLIST_COUNT: ${MAX_PLAYLIST_COUNT}
+      MAX_SUB_QUALITY: ${MAX_SUB_QUALITY}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE}
+      RATE_LIMIT_PER_HOUR: ${RATE_LIMIT_PER_HOUR}
+      RATE_LIMIT_PER_DAY: ${RATE_LIMIT_PER_DAY}
+      TURN_OFF_LIMITS_FOR_ADMINS: ${TURN_OFF_LIMITS_FOR_ADMINS}
+      USE_FIREBASE: ${USE_FIREBASE}
+      DATA_DIR: ${DATA_DIR}
+      HEALTH_STRICT: ${HEALTH_STRICT}
+      VERBOSE_LOGGING: ${VERBOSE_LOGGING}
+    deploy:
+      resources:
+        limits:
+          memory: '53687091'
+          cpus: 0.05
+        reservations: {}
+    mem_limit: 53687091
+    memswap_limit: 53687091
+    cpus: 0.05
   dashboard:
     container_name: tg-ytdlp-dashboard
     build:
       context: .
       dockerfile: Dockerfile.vps
       args:
-        <<: *default-build-args
-    env_file:
-      - .env
+        TZ: "${TZ}"
     restart: unless-stopped
-    logging: *default-logging
+    logging:
+      driver: local
+      options:
+        max-size: "1G"
+        max-file: "1"
+        compress: "false"
     depends_on:
-      - bot
+    - bot
     volumes:
-      - .:/app
-      - /var/run/docker.sock:/var/run/docker.sock
+    - .:/app
+    - /var/run/docker.sock:/var/run/docker.sock
     working_dir: /app
-    command: ["python", "-m", "uvicorn", "web.dashboard_app:app", "--host", "0.0.0.0", "--port", "5555"]
-    ports:
-      - "5555:5555"
+    command:
+    - "python"
+    - "-m"
+    - "uvicorn"
+    - "web.dashboard_app:app"
+    - "--host"
+    - "0.0.0.0"
+    - "--port"
+    - "5555"
     environment:
-      - BOT_CONTAINER_NAME=tg-ytdlp-bot
-      - WARP_CONTAINER_NAME=tg-ytdlp-warp
-
+      BOT_TOKEN: ${BOT_TOKEN}
+      API_ID: ${API_ID}
+      API_HASH: ${API_HASH}
+      BOT_NAME: ${BOT_NAME}
+      BOT_NAME_FOR_USERS: ${BOT_NAME_FOR_USERS}
+      ADMIN: ${ADMIN}
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
+      LOGS_ID: ${LOGS_ID}
+      LOG_EXCEPTION: ${LOG_EXCEPTION}
+      LOGS_VIDEO_ID: ${LOGS_VIDEO_ID}
+      LOGS_NSFW_ID: ${LOGS_NSFW_ID}
+      LOGS_IMG_ID: ${LOGS_IMG_ID}
+      LOGS_PAID_ID: ${LOGS_PAID_ID}
+      TZ: ${TZ}
+      ADMIN_GROUP: ${ADMIN_GROUP}
+      ALLOWED_GROUP: ${ALLOWED_GROUP}
+      ALLOWED_USERS: ${ALLOWED_USERS}
+      MINIAPP_URL: ${MINIAPP_URL}
+      STAR_RECEIVER: ${STAR_RECEIVER}
+      SUBSCRIBE_CHANNEL: ${SUBSCRIBE_CHANNEL}
+      SUBSCRIBE_CHANNEL_URL: ${SUBSCRIBE_CHANNEL_URL}
+      CHANNEL_GUARD_SESSION_STRING: ${CHANNEL_GUARD_SESSION_STRING}
+      COOKIES_CONTENT: ${COOKIES_CONTENT}
+      YOUTUBE_COOKIES_CONTENT: ${YOUTUBE_COOKIES_CONTENT}
+      COOKIE_URL: ${COOKIE_URL}
+      YOUTUBE_COOKIE_URL: ${YOUTUBE_COOKIE_URL}
+      YOUTUBE_COOKIE_ORDER: ${YOUTUBE_COOKIE_ORDER}
+      INSTAGRAM_COOKIE_URL: ${INSTAGRAM_COOKIE_URL}
+      TIKTOK_COOKIE_URL: ${TIKTOK_COOKIE_URL}
+      TWITTER_COOKIE_URL: ${TWITTER_COOKIE_URL}
+      VK_COOKIE_URL: ${VK_COOKIE_URL}
+      YOUTUBE_POT_ENABLED: ${YOUTUBE_POT_ENABLED}
+      YOUTUBE_POT_BASE_URL: ${YOUTUBE_POT_BASE_URL}
+      YOUTUBE_POT_DISABLE_INNERTUBE: ${YOUTUBE_POT_DISABLE_INNERTUBE}
+      PROXY_TYPE: ${PROXY_TYPE}
+      PROXY_IP: ${PROXY_IP}
+      PROXY_PORT: ${PROXY_PORT}
+      PROXY_USER: ${PROXY_USER}
+      PROXY_PASSWORD: ${PROXY_PASSWORD}
+      PROXY_SELECT: ${PROXY_SELECT}
+      MAX_FILE_SIZE_GB: ${MAX_FILE_SIZE_GB}
+      MAX_CONCURRENT_DOWNLOADS: ${MAX_CONCURRENT_DOWNLOADS}
+      MAX_CONCURRENT_UPLOADS: ${MAX_CONCURRENT_UPLOADS}
+      TG_YTDLP_BG_WORKERS: ${TG_YTDLP_BG_WORKERS}
+      TG_YTDLP_BG_INFLIGHT: ${TG_YTDLP_BG_INFLIGHT}
+      DOWNLOAD_TIMEOUT: ${DOWNLOAD_TIMEOUT}
+      MAX_VIDEO_DURATION: ${MAX_VIDEO_DURATION}
+      MAX_PLAYLIST_COUNT: ${MAX_PLAYLIST_COUNT}
+      MAX_SUB_QUALITY: ${MAX_SUB_QUALITY}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE}
+      RATE_LIMIT_PER_HOUR: ${RATE_LIMIT_PER_HOUR}
+      RATE_LIMIT_PER_DAY: ${RATE_LIMIT_PER_DAY}
+      TURN_OFF_LIMITS_FOR_ADMINS: ${TURN_OFF_LIMITS_FOR_ADMINS}
+      USE_FIREBASE: ${USE_FIREBASE}
+      DATA_DIR: ${DATA_DIR}
+      HEALTH_STRICT: ${HEALTH_STRICT}
+      VERBOSE_LOGGING: ${VERBOSE_LOGGING}
+    expose:
+    - "5555"
+    deploy:
+      resources:
+        limits:
+          memory: '53687091'
+          cpus: 0.05
+        reservations: {}
+    mem_limit: 53687091
+    memswap_limit: 53687091
+    cpus: 0.05
   bgutil-provider:
     image: brainicism/bgutil-ytdlp-pot-provider:latest
     container_name: tg-ytdlp-bgutil-provider
     restart: unless-stopped
-    logging: *default-logging
+    logging:
+      driver: local
+      options:
+        max-size: "1G"
+        max-file: "1"
+        compress: "false"
     network_mode: "container:tg-ytdlp-warp"
-    ports: []
     expose: []
     depends_on:
       warp:
         condition: service_healthy
-
-  # Cookie/config webserver (Caddy). Serves docker/configuration-webserver/site/ over HTTP
-  # for COOKIE_URL / *_COOKIE_URL. It shares warp's network namespace (like
-  # bgutil-provider), because warp overrides the bot's DNS (to 1.1.1.1) and
-  # service-name resolution over warp-net does not work; in the shared namespace
-  # the bot reaches Caddy (:80) at http://localhost/cookies/<file>.
-  # Opt-in: NOT started by `docker compose up -d`.
-  # Run it with:  docker compose --profile configuration-webserver up -d
+    deploy:
+      resources:
+        limits:
+          memory: '53687091'
+          cpus: 0.05
+        reservations: {}
+    mem_limit: 53687091
+    memswap_limit: 53687091
+    cpus: 0.05
   configuration-webserver:
-    profiles: ["configuration-webserver"]
+    profiles:
+    - "configuration-webserver"
     container_name: tg-ytdlp-configuration-webserver
     image: caddy:2-alpine
     restart: unless-stopped
-    logging: *default-logging
+    logging:
+      driver: local
+      options:
+        max-size: "1G"
+        max-file: "1"
+        compress: "false"
     network_mode: "container:tg-ytdlp-warp"
     depends_on:
       warp:
         condition: service_healthy
     volumes:
-      - ./docker/configuration-webserver/conf:/etc/caddy:ro
-      - ./docker/configuration-webserver/site:/srv:ro
-      - caddy-data:/data
-      - caddy-config:/config
-
+    - ./docker/configuration-webserver/conf:/etc/caddy:ro
+    - ./docker/configuration-webserver/site:/srv:ro
+    - caddy-data:/data
+    - caddy-config:/config
+    deploy:
+      resources:
+        limits:
+          memory: '53687091'
+          cpus: 0.05
+        reservations: {}
+    mem_limit: 53687091
+    memswap_limit: 53687091
+    cpus: 0.05
   warp:
     build: ./warp
     container_name: tg-ytdlp-warp
     restart: unless-stopped
-    logging: *default-logging
+    logging:
+      driver: local
+      options:
+        max-size: "1G"
+        max-file: "1"
+        compress: "false"
     privileged: true
     dns:
-      - 1.1.1.1
-      - 1.0.0.1
-      - 2606:4700:4700::1111
-      - 2606:4700:4700::1001
+    - 1.1.1.1
+    - 1.0.0.1
+    - 2606:4700:4700::1111
+    - 2606:4700:4700::1001
     sysctls:
       net.ipv6.conf.all.disable_ipv6: 0
       net.ipv4.conf.all.src_valid_mark: 1
     volumes:
-      - warp-data:/data
+    - warp-data:/data
     networks:
-      - warp-net
+    - warp-net
     healthcheck:
-      # WireGuard interface must be up; DNS reachability is best-effort
-      # (google.com may fail on geo-blocked/DNS-restricted hosts without
-      # meaning the tunnel itself is broken, so we don't block startup on it)
-      test: ["CMD-SHELL", "wg show wgcf >/dev/null 2>&1"]
+      test:
+      - "CMD-SHELL"
+      - "wg show wgcf >/dev/null 2>&1"
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 40s
-
+    deploy:
+      resources:
+        limits:
+          memory: '53687091'
+          cpus: 0.05
+        reservations: {}
+    mem_limit: 53687091
+    memswap_limit: 53687091
+    cpus: 0.05
 networks:
   warp-net:
     driver: bridge
-
 volumes:
-  warp-data:
-  caddy-data:
+  warp-data: 
+  caddy-data: 
   caddy-config:
