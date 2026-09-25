@@ -88,9 +88,11 @@ Dockerfile
 .dockerignore
 # Note: docker-entrypoint.sh is needed in the container, so it's not ignored
 
-# Config files with secrets (mounted as volume)
+# فایل‌های شخصی/سری
 .env
-CONFIG/config.py
+# ⚠️ CONFIG/config.py عمداً داخل ایمیج می‌رود: این نسخه env-محور است و
+#    هیچ مقداری داخلش نیست (همه از Variables خوانده می‌شود).
+!CONFIG/config.py
 
 # Binary files
 yt-dlp
