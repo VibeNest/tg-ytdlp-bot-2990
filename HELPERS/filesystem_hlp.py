@@ -1,0 +1,531 @@
+import signal
+import os
+import re
+import sys
+import shutil
+import threading
+import unicodedata
+import json
+import tempfile
+
+from HELPERS.app_instance import get_app
+from HELPERS.logger import logger
+from HELPERS.limitter import humanbytes
+from CONFIG.config import Config
+from CONFIG.logger_msg import LoggerMsg
+from pyrogram import enums
+
+# Get app instance for decorators
+app = get_app()
+
+def close_firebase_connections():
+    """Close Firebase connections to prevent file descriptor leaks"""
+    try:
+        from DATABASE.firebase_init import db
+        if hasattr(db, 'close'):
+            db.close()
+            logger.info(LoggerMsg.FILESYSTEM_FIREBASE_CLOSED_LOG_MSG)
+    except Exception as e:
+        logger.error(LoggerMsg.FILESYSTEM_FIREBASE_CLOSE_ERROR_LOG_MSG.format(error=e))
+
+def signal_handler(sig, frame):
+    """
+    Handler for system signals to ensure graceful shutdown
+
+    Args:
+        sig: Signal number
+        frame: Current stack frame
+    """
+    logger.info(LoggerMsg.FILESYSTEM_SIGNAL_RECEIVED_LOG_MSG.format(signal=sig))
+
+    # Close Firebase connections first
+    close_firebase_connections()
+
+    # Stop all active animations and threads
+    active_threads = [t for t in threading.enumerate()
+                     if t != threading.current_thread() and not t.daemon]
+
+    if active_threads:
+        logger.info(LoggerMsg.FILESYSTEM_WAITING_THREADS_LOG_MSG.format(count=len(active_threads)))
+        for thread in active_threads:
+            logger.info(LoggerMsg.FILESYSTEM_WAITING_THREAD_LOG_MSG.format(name=thread.name))
+            thread.join(timeout=2)  # Wait with timeout to avoid hanging
+
+    # Clean up temporary files
+    try:
+        cleanup_temp_files()
+    except Exception as e:
+        logger.error(LoggerMsg.FILESYSTEM_CLEANUP_ERROR_LOG_MSG.format(error=e))
+
+    # Finish the application
+    logger.info(LoggerMsg.FILESYSTEM_SHUTTING_DOWN_PYROGRAM_LOG_MSG)
+    try:
+        # Get app instance dynamically (may be None if not initialized)
+        app_instance = get_app()
+        if app_instance is not None:
+            app_instance.stop()
+            logger.info(LoggerMsg.FILESYSTEM_PYROGRAM_STOPPED_LOG_MSG)
+        else:
+            logger.info("Pyrogram client not initialized, skipping stop")
+    except Exception as e:
+        logger.error(LoggerMsg.FILESYSTEM_PYROGRAM_STOP_ERROR_LOG_MSG.format(error=e))
+
+    # Close logger handlers
+    try:
+        from HELPERS.logger import close_logger
+        close_logger()
+    except Exception as e:
+        logger.error(LoggerMsg.FILESYSTEM_LOGGER_CLOSE_ERROR_LOG_MSG.format(error=e))
+
+    logger.info(LoggerMsg.FILESYSTEM_SHUTDOWN_COMPLETE_LOG_MSG)
+    sys.exit(0)
+
+def cleanup_temp_files():
+    """Clean up temporary files across all user directories"""
+    if not os.path.exists("users"):
+        return
+
+    logger.info(LoggerMsg.FILESYSTEM_CLEANING_TEMP_FILES_LOG_MSG)
+    for user_dir in os.listdir("users"):
+        try:
+            user_path = os.path.join("users", user_dir)
+            if os.path.isdir(user_path):
+                for filename in os.listdir(user_path):
+                    if filename.endswith(('.part', '.ytdl', '.temp', '.tmp', '.json', '.jsonl', '.srt', '.vtt', '.ass', '.ssa')):
+                        try:
+                            os.remove(os.path.join(user_path, filename))
+                        except Exception as e:
+                            logger.error(LoggerMsg.FILESYSTEM_FAILED_REMOVE_TEMP_FILE_LOG_MSG.format(filename=filename, error=e))
+        except Exception as e:
+            logger.error(LoggerMsg.FILESYSTEM_ERROR_CLEANING_USER_DIR_LOG_MSG.format(user_dir=user_dir, error=e))
+
+def cleanup_user_temp_files(user_id):
+    """Clean up temporary files and media files in download folders for a specific user"""
+    user_dir = os.path.join("users", str(user_id))
+    if not os.path.exists(user_dir):
+        return
+    
+    logger.info(LoggerMsg.FILESYSTEM_CLEANING_USER_TEMP_FILES_LOG_MSG.format(user_id=user_id))
+    
+    # Log all files before cleanup
+    try:
+        all_files = os.listdir(user_dir)
+        logger.info(LoggerMsg.FILESYSTEM_FILES_BEFORE_CLEANUP_LOG_MSG.format(user_dir=user_dir, files=all_files))
+    except Exception as e:
+        logger.error(LoggerMsg.FILESYSTEM_ERROR_LISTING_FILES_LOG_MSG.format(user_dir=user_dir, error=e))
+        return
+    
+    try:
+        # Clean files in root directory
+        for filename in os.listdir(user_dir):
+            file_path = os.path.join(user_dir, filename)
+            
+            # Skip subdirectories (download folders are handled separately)
+            if os.path.isdir(file_path):
+                continue
+                
+            # Remove temporary files and media files
+            if (filename.endswith(('.part', '.ytdl', '.temp', '.tmp', '.json', '.jsonl', '.srt', '.vtt', '.ass', '.ssa', '.mp3', '.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4a', '.aac', '.ogg', '.wav')) or  # Media files
+                filename.startswith('yt_thumb_') or  # YouTube thumbnails
+                filename.endswith('.jpg') or  # Thumbnails
+                filename == 'full_title.txt' or  # Full title file
+                filename == 'full_description.txt'):  # Tags file
+                # Skip formats_cache files - they should be preserved
+                if filename.startswith('formats_cache_') and filename.endswith('.json'):
+                    continue
+                try:
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                        logger.info(LoggerMsg.FILESYSTEM_REMOVED_TEMP_FILE_LOG_MSG.format(filename=filename))
+                except Exception as e:
+                    logger.error(LoggerMsg.FILESYSTEM_FAILED_REMOVE_TEMP_FILE_LOG_MSG.format(filename=filename, error=e))
+        
+        # Clean media files in download folders (but keep txt, json, jpg, jpeg, png files)
+        download_folders = ["downloads", "cyberdrop.me"]
+        for folder_name in download_folders:
+            folder_path = os.path.join(user_dir, folder_name)
+            if os.path.exists(folder_path) and os.path.isdir(folder_path):
+                cleanup_media_in_download_folder(folder_path)
+                
+    except Exception as e:
+        logger.error(LoggerMsg.FILESYSTEM_ERROR_CLEANING_USER_DIR_LOG_MSG.format(user_dir=user_id, error=e))
+
+def cleanup_media_in_download_folder(folder_path):
+    """Clean up media files in download folder, keeping txt, json, jpg, jpeg, png files"""
+    try:
+        for root, dirs, files in os.walk(folder_path):
+            # Skip subdirectories that are protected (parallel downloads in progress)
+            protected_dirs = []
+            for d in dirs:
+                sub_path = os.path.join(root, d)
+                if is_directory_protected(sub_path):
+                    protected_dirs.append(d)
+                    logger.info(f"Skipping protected subdirectory: {sub_path}")
+            for d in protected_dirs:
+                dirs.remove(d)
+            
+            for filename in files:
+                file_path = os.path.join(root, filename)
+
+                # Keep txt, json, jpg, jpeg, png files
+                if filename.endswith(('.txt', '.json', '.jpg', '.jpeg', '.png')):
+                    continue
+
+                # Always keep formats_cache files
+                if filename.startswith('formats_cache_') and filename.endswith('.json'):
+                    continue
+
+                # IMPORTANT:
+                # Do NOT delete final media files from the downloads/ subdirectories here.
+                # These folders are used to store already-downloaded videos (including
+                # playlist items). Removing .mp4/.mkv/etc. too aggressively may lead to
+                # situations where Pyrogram tries to send a file that has just been
+                # cleaned up, causing errors like:
+                #   "Failed to decode \".../downloads/.../file.mp4\". The value does not
+                #    represent an existing local file, HTTP URL, or valid file id."
+                #
+                # Therefore we only clean up *temporary/incomplete* artifacts here.
+
+                # Remove only temporary/partial download artifacts
+                if filename.endswith(('.part', '.ytdl', '.temp', '.tmp')):
+                    try:
+                        import time
+                        file_mtime = os.path.getmtime(file_path)
+                        current_time = time.time()
+                        if current_time - file_mtime < 30:
+                            logger.info(f"Skipping recent .part file: {file_path}")
+                            continue
+                        os.remove(file_path)
+                        logger.info(f"Removed temporary download artifact: {file_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to remove temporary download artifact {file_path}: {e}")
+    except Exception as e:
+        logger.error(f"Error cleaning media in download folder {folder_path}: {e}")
+
+def cleanup_subtitle_files(user_id):
+    """Clean up subtitle files for a specific user after embedding (only in root directory, not in protected subdirectories)"""
+    user_dir = os.path.join("users", str(user_id))
+    if not os.path.exists(user_dir):
+        return
+    
+    logger.info(LoggerMsg.FILESYSTEM_CLEANING_SUBTITLE_FILES_LOG_MSG.format(user_id=user_id))
+    
+    try:
+        # Only clean files in root directory, not in subdirectories (which might be protected)
+        for filename in os.listdir(user_dir):
+            file_path = os.path.join(user_dir, filename)
+            # Skip subdirectories (they might be protected download folders)
+            if os.path.isdir(file_path):
+                continue
+                
+            # Remove subtitle files
+            if filename.endswith(('.srt', '.vtt', '.ass', '.ssa', '.json', '.jsonl')):
+                try:
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                        logger.info(LoggerMsg.FILESYSTEM_REMOVED_SUBTITLE_FILE_LOG_MSG.format(filename=filename))
+                except Exception as e:
+                    logger.error(LoggerMsg.FILESYSTEM_FAILED_REMOVE_SUBTITLE_FILE_LOG_MSG.format(filename=filename, error=e))
+    except Exception as e:
+        logger.error(LoggerMsg.FILESYSTEM_ERROR_CLEANING_SUBTITLE_FILES_LOG_MSG.format(user_id=user_id, error=e))
+
+# Register handlers for the most common termination signals
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+
+# Helper function to check available disk space
+def check_disk_space(path, required_bytes):
+    """
+    Checks if there's enough disk space available at the specified path.
+
+    Args:
+        path (str): Path to check
+        required_bytes (int): Required bytes of free space
+
+    Returns:
+        bool: True if enough space is available, False otherwise
+    """
+    try:
+        total, used, free = shutil.disk_usage(path)
+        if free and free < required_bytes:
+            logger.warning(
+                f"Not enough disk space. Required: {humanbytes(required_bytes)}, Available: {humanbytes(free)}")
+            return False
+        return True
+    except Exception as e:
+        logger.error(LoggerMsg.FILESYSTEM_ERROR_CHECKING_DISK_SPACE_LOG_MSG.format(error=e))
+        # If we can't check, assume there's enough space
+        return True
+
+def create_directory(path):
+    # Create The Directory (And All Intermediate Directories) IF Its Not Exist.
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+
+
+# Remove All User Media Files
+
+def remove_media(message, only=None, force_clean=False):
+    """
+    Remove media files from user directory.
+    
+    Args:
+        message: Telegram message object
+        only: List of specific files to remove (if None, removes all media files)
+        force_clean: If True, ignores protection files and cleans everything (for /clean command)
+    """
+    dir = f'./users/{str(message.chat.id)}'
+    if not os.path.exists(dir):
+        logger.warning(LoggerMsg.FILESYSTEM_DIRECTORY_NOT_EXISTS_LOG_MSG.format(directory=dir))
+        return
+    
+    if only:
+        for fname in only:
+            file_path = os.path.join(dir, fname)
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    logger.info(LoggerMsg.FILESYSTEM_REMOVED_FILE_LOG_MSG.format(file_path=file_path))
+                except Exception as e:
+                    logger.error(LoggerMsg.FILESYSTEM_FAILED_REMOVE_FILE_LOG_MSG.format(file_path=file_path, error=e))
+        return
+    
+    # Common file extensions to remove
+    file_extensions = [
+        '.mp4', '.mkv', '.mp3', '.m4a', '.jpg', '.jpeg', '.part', '.ytdl',
+        '.txt', '.ts', '.m3u8', '.webm', '.wmv', '.avi', '.mpeg', '.wav',
+        '.json', '.jsonl', '.srt', '.vtt', '.ass', '.ssa',
+    ]
+    protected_txt_files = {'logs.txt', 'tags.txt', 'keyboard.txt', 'lang.txt', 'cookie.txt'}
+
+    def _remove_matching_files(file_list):
+        for extension in file_extensions:
+            files = [f for f in file_list if f.endswith(extension)]
+            for file in files:
+                if extension == '.txt' and file in protected_txt_files:
+                    continue
+                # Skip incomplete download artifacts (.part / .ytdl): removing them
+                # mid-download causes "Unable to rename .part" / Errno 2 race conditions
+                # (issue #299). They are either completed (renamed to final extension) or
+                # reaped by a later clean once the download is done.
+                if extension in ('.part', '.ytdl'):
+                    logger.debug(LoggerMsg.FILESYSTEM_FAILED_REMOVE_FILE_LOG_MSG.format(
+                        file_path=os.path.join(dir, file), error="incomplete download artifact, skipped"))
+                    continue
+                file_path = os.path.join(dir, file)
+                try:
+                    os.remove(file_path)
+                    logger.info(LoggerMsg.FILESYSTEM_REMOVED_FILE_LOG_MSG.format(file_path=file_path))
+                except Exception as e:
+                    logger.error(LoggerMsg.FILESYSTEM_FAILED_REMOVE_FILE_LOG_MSG.format(file_path=file_path, error=e))
+
+    allfiles = os.listdir(dir)
+
+    # Check if parallel downloads are allowed and we're not forcing cleanup
+    if not force_clean and is_parallel_download_allowed(message):
+        # For parallel downloads, only clean files in root directory, skip protected subdirectories
+        _remove_matching_files(allfiles)
+        
+        # Clean unprotected subdirectories
+        for item in allfiles:
+            item_path = os.path.join(dir, item)
+            if os.path.isdir(item_path):
+                if not is_directory_protected(item_path):
+                    try:
+                        shutil.rmtree(item_path)
+                        logger.info(LoggerMsg.FILESYSTEM_REMOVED_UNPROTECTED_DIR_LOG_MSG.format(item_path=item_path))
+                    except Exception as e:
+                        logger.error(LoggerMsg.FILESYSTEM_FAILED_REMOVE_DIRECTORY_LOG_MSG.format(item_path=item_path, error=e))
+                else:
+                    logger.info(LoggerMsg.FILESYSTEM_SKIPPED_PROTECTED_DIR_LOG_MSG.format(item_path=item_path))
+    else:
+        # For non-parallel downloads or force cleanup, clean everything
+        _remove_matching_files(allfiles)
+    
+    logger.info(LoggerMsg.FILESYSTEM_MEDIA_CLEANUP_COMPLETED_LOG_MSG.format(user_id=message.chat.id))
+
+# Helper function to sanitize and shorten filenames
+
+# Characters kept during sanitization: letters, numbers, spaces, safe symbols
+_SAFE_CHARS = set(".-_()")
+
+
+def _truncate_name(name, ext, max_total):
+    """Truncate name part so that name+ext fits within max_total bytes.
+
+    NAME_MAX on most filesystems (ext4/XFS/NTFS) is measured in BYTES, not
+    characters. CJK/emoji filenames use 3-4 bytes per character, so counting
+    code points (len()) under-truncates and triggers Errno 36 (issue #315).
+    """
+    full_name = name + ext
+    try:
+        full_name_bytes = len(full_name.encode("utf-8"))
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        full_name_bytes = len(full_name)
+    if full_name_bytes <= max_total:
+        return full_name
+
+    ext_bytes = _byte_len(ext)
+    max_name_bytes = max_total - ext_bytes
+    if max_name_bytes <= 0:
+        return ext
+
+    # Trim character-by-character until the byte budget is met (avoids splitting
+    # a multi-byte UTF-8 sequence).
+    truncated = name
+    while _byte_len(truncated) > max_name_bytes and truncated:
+        truncated = truncated[:-1]
+
+    return truncated + ext
+
+
+def _byte_len(text):
+    """Return the byte length of text, falling back to char length on error."""
+    try:
+        return len(text.encode("utf-8"))
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return len(text)
+
+
+def atomic_write_json(file_path, data, indent=2, ensure_ascii=False):
+    """Write JSON to file_path atomically (temp file + os.replace).
+
+    Prevents corrupted JSON when the process is interrupted mid-write or when
+    multiple processes read the file concurrently (issue #316).
+    """
+    directory = os.path.dirname(file_path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=ensure_ascii, indent=indent)
+        os.replace(tmp_path, file_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _clean_unicode_name(name):
+    """Normalize Unicode and keep only safe characters (letters, digits, spaces, .-_())."""
+    name = unicodedata.normalize("NFKC", name)
+    cleaned = []
+    for char in name:
+        if char.isalnum() or char.isspace() or char in _SAFE_CHARS:
+            cleaned.append(char)
+    return "".join(cleaned)
+
+
+def sanitize_filename(filename, max_length=150):
+    """
+    Sanitize filename by removing invalid characters and shortening if needed.
+    Only allows letters (any language), numbers, and Linux-safe symbols.
+    """
+    if filename is None:
+        return "untitled"
+
+    name, ext = os.path.splitext(filename)
+    name = _clean_unicode_name(name)
+
+    # Remove invalid filesystem characters
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', name)
+    name = name.strip(' .')
+    name = re.sub(r'[\s.]+', ' ', name).strip()
+
+    if not name:
+        name = "untitled"
+
+    return _truncate_name(name, ext, 100)
+
+
+def sanitize_filename_strict(filename, max_length=100):
+    """
+    Strict sanitization for filenames - removes all characters except ASCII letters and numbers,
+    replaces spaces with underscores. Strips diacritics (accents) to ensure ASCII-only paths.
+    Used specifically for yt-dlp file downloads and must produce Pyrogram-safe file paths.
+    """
+    if filename is None:
+        return "untitled"
+
+    name, ext = os.path.splitext(filename)
+    name = unicodedata.normalize("NFKC", name)
+
+    # Strip diacritics/accent marks: ó→o, ñ→n, í→i, á→a, etc.
+    name = unicodedata.normalize('NFD', name)
+    name = ''.join(c for c in name if unicodedata.category(c) != 'Mn')
+
+    # Keep only ASCII letters, numbers, underscores, hyphens, dots, parentheses
+    name = re.sub(r'[^a-zA-Z0-9_\-\.\(\)]', '_', name)
+    name = re.sub(r'_+', '_', name)
+    name = name.strip('_')
+
+    if not name:
+        name = "untitled"
+
+    return _truncate_name(name, ext, max_length)
+
+def is_parallel_download_allowed(message):
+    """
+    Check if parallel downloads are allowed for this user/chat.
+    Allowed for:
+    1. Groups (chat_id < 0)
+    2. Admin users in private chats (chat_id > 0)
+    """
+    try:
+        # Groups always allow parallel downloads
+        if message.chat.id < 0:
+            return True
+        
+        # For private chats, only admins can have parallel downloads
+        if message.chat.id > 0:
+            return int(message.chat.id) in Config.ADMIN
+        
+        return False
+    except Exception as e:
+        logger.warning(LoggerMsg.FILESYSTEM_ERROR_CHECKING_PARALLEL_PERMISSION_LOG_MSG.format(error=e))
+        return False
+
+def create_protection_file(directory_path):
+    """
+    Create do_not_delete_me file in the specified directory to protect it from cleanup.
+    """
+    try:
+        protection_file = os.path.join(directory_path, "do_not_delete_me")
+        with open(protection_file, 'w') as f:
+            f.write(f"Protected directory created at: {os.path.basename(directory_path)}\n")
+            f.write("This directory is currently being used for download.\n")
+            f.write("Do not delete this directory until download is complete.\n")
+        logger.info(LoggerMsg.FILESYSTEM_CREATED_PROTECTION_FILE_LOG_MSG.format(protection_file=protection_file))
+        return True
+    except Exception as e:
+        logger.error(LoggerMsg.FILESYSTEM_FAILED_CREATE_PROTECTION_FILE_LOG_MSG.format(directory_path=directory_path, error=e))
+        return False
+
+def remove_protection_file(directory_path):
+    """
+    Remove do_not_delete_me file from the specified directory.
+    """
+    try:
+        protection_file = os.path.join(directory_path, "do_not_delete_me")
+        if os.path.exists(protection_file):
+            os.remove(protection_file)
+            logger.info(LoggerMsg.FILESYSTEM_REMOVED_PROTECTION_FILE_LOG_MSG.format(protection_file=protection_file))
+            return True
+        return False
+    except Exception as e:
+        logger.error(LoggerMsg.FILESYSTEM_FAILED_REMOVE_PROTECTION_FILE_LOG_MSG.format(directory_path=directory_path, error=e))
+        return False
+
+def is_directory_protected(directory_path):
+    """
+    Check if directory is protected by do_not_delete_me file.
+    """
+    try:
+        protection_file = os.path.join(directory_path, "do_not_delete_me")
+        return os.path.exists(protection_file)
+    except Exception as e:
+        logger.error(LoggerMsg.FILESYSTEM_ERROR_CHECKING_PROTECTION_FILE_LOG_MSG.format(directory_path=directory_path, error=e))
+        return False

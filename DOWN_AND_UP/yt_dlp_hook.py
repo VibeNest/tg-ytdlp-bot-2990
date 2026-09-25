@@ -1,0 +1,669 @@
+# --- receiving formats and metadata via yt-dlp ---
+import os
+import yt_dlp
+from CONFIG.config import Config
+from CONFIG.messages import Messages, safe_get_messages
+from HELPERS.logger import logger, send_error_to_user
+from HELPERS.filesystem_hlp import create_directory
+from URL_PARSERS.nocookie import is_no_cookie_domain
+from URL_PARSERS.youtube import is_youtube_url
+from URL_PARSERS.filter_check import is_no_filter_domain
+from URL_PARSERS.filter_utils import create_smart_match_filter, create_legacy_match_filter
+from HELPERS.pot_helper import add_pot_to_ytdl_opts
+from CONFIG.limits import LimitsConfig
+from HELPERS.fallback_helper import should_fallback_to_gallery_dl, gallery_dl_has_extractor
+
+
+# Permanent, non-transient errors that cannot be fixed by retries, cookies,
+# proxy rotation or impersonation. Detecting them early prevents expensive
+# multi-strategy retry storms (issues #323, #329, #330).
+_RATE_LIMIT_INDICATORS = (
+    'rate limit', 'rate-limit', 'rate-limited', 'too many requests',
+    '429', 'has been rate-limited',
+    # YouTube "Please try again later" (issue #446) — transient server-side
+    # throttle; retrying immediately worsens it. Abort retries and let the
+    # caller show a clear "try again in a few minutes" message.
+    'try again later', 'please try again',
+)
+_PERMANENT_UNAVAILABLE_INDICATORS = (
+    'does not exist', 'not exist', 'playlist does not exist',
+    'video does not exist', 'channel does not exist', 'user does not exist',
+    'no longer available', 'video unavailable', 'private video',
+    'this content isn\'t available', 'this content is not available',
+    'removed for violating', "terms of service", 'has been removed',
+    # Premiere not yet started (issue #387) — retrying immediately is pointless
+    'premieres in', 'premieres on',
+    # YouTube bot-detection / PO-token (issue #394) — cookie rotation never
+    # fixes this; fail fast to prevent the 22+ case retry storm
+    'sign in to confirm', 'not a bot',
+    # YouTube frontend challenge (issue #436) — "The page needs to be reloaded"
+    # is a new bot-detection challenge; cannot be fixed by cookies/proxy/format
+    'page needs to be reloaded',
+    # YouTube community post / tab page (issue #391) — not a downloadable video
+    'does not have a',
+    # Upstream extractor regressions — the extractor received a structurally
+    # unparseable response (TikTok challenge change, issue #452/#445) or a
+    # playlist with no supported entries (tvp.pl DRM/geo, issue #450).
+    # Cookie/proxy retries cannot fix a broken extractor: abort immediately.
+    'unexpected response from webpage request',
+    'skipping unsupported file type',
+    # Instagram post inaccessible without an account (issue #373): the API
+    # returns an empty media payload; cookies are the only possible fix, so
+    # abort retries and let the menu show the cookie hint.
+    'empty media response',
+)
+
+
+# Transient network-level failures (issue #464): a single read timeout from
+# YouTube during WG-tunnel degradation is not permanent — retry once with a
+# longer socket_timeout before falling through to the proxy fallback chain.
+_TRANSIENT_TIMEOUT_INDICATORS = (
+    'read timed out',
+    'connection reset',
+    'connection aborted',
+    'connection refused',
+    'temporary failure in name resolution',
+    'name or service not known',
+)
+
+
+def _is_rate_limited(error_lower):
+    return any(k in error_lower for k in _RATE_LIMIT_INDICATORS)
+
+
+def _is_transient_network_timeout(error_lower):
+    return any(k in error_lower for k in _TRANSIENT_TIMEOUT_INDICATORS)
+
+
+def _is_permanent_unavailable(error_lower):
+    return any(k in error_lower for k in _PERMANENT_UNAVAILABLE_INDICATORS)
+
+
+def get_video_formats(url, user_id=None, playlist_start_index=1, cookies_already_checked=False, use_proxy=False, playlist_end_index=None):
+    # ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ ДЛЯ ОТЛАДКИ
+    logger.info(f"🔍 [DEBUG] get_video_formats вызвана с параметрами:")
+    logger.info(f"   url: {url}")
+    logger.info(f"   user_id: {user_id}")
+    logger.info(f"   playlist_start_index: {playlist_start_index}")
+    logger.info(f"   playlist_end_index: {playlist_end_index}")
+    logger.info(f"   cookies_already_checked: {cookies_already_checked}")
+    logger.info(f"   use_proxy: {use_proxy}")
+    
+    # Resolve Facebook share-redirect URLs (/share/v/, /share/r/, fb.watch) to
+    # canonical video URLs that yt-dlp can extract (issue #392). Defensive: on
+    # any failure the original URL is used unchanged.
+    try:
+        from URL_PARSERS.normalizer import resolve_facebook_share_url
+        _resolved = resolve_facebook_share_url(url)
+        if _resolved != url:
+            logger.info(f"get_video_formats: resolved Facebook share URL '{url}' -> '{_resolved}'")
+            url = _resolved
+    except Exception as _fb_err:
+        logger.debug(f"get_video_formats: Facebook share resolution skipped: {_fb_err}")
+    
+    # ВНИМАНИЕ ПО ПРОИЗВОДИТЕЛЬНОСТИ:
+    # Раньше здесь безусловно сбрасывался кеш проверенных источников YouTube‑куки.
+    # Это приводило к тому, что при каждом новом URL бот заново перебирал и проверял
+    # все источники куки, даже если у пользователя уже лежит рабочий cookie.txt.
+    # Теперь сброс источников выполняется _только_ в тех местах, где реально
+    # начинается перебор новых источников (см. ниже), а не при каждом вызове.
+    messages = safe_get_messages(user_id)
+    
+    # Формируем playlist_items с учетом диапазона
+    if playlist_end_index is not None and playlist_end_index != playlist_start_index:
+        # Для диапазона используем формат START:END или START:END:-1 для обратного порядка
+        if playlist_start_index < 0 or playlist_end_index < 0:
+            # Для отрицательных индексов определяем обратный порядок
+            is_reverse = (playlist_start_index < 0 and playlist_end_index < 0 and abs(playlist_start_index) < abs(playlist_end_index)) or (playlist_start_index > playlist_end_index)
+            if is_reverse:
+                playlist_items_str = f"{playlist_start_index}:{playlist_end_index}:-1"
+            else:
+                playlist_items_str = f"{playlist_start_index}:{playlist_end_index}"
+        elif playlist_start_index > playlist_end_index:
+            # Для обратного порядка с положительными индексами
+            playlist_items_str = f"{playlist_start_index}:{playlist_end_index}:-1"
+        else:
+            # Для прямого порядка
+            playlist_items_str = f"{playlist_start_index}:{playlist_end_index}"
+    else:
+        # Для одного элемента
+        playlist_items_str = str(playlist_start_index)
+    
+    ytdl_opts = {
+        'quiet': True,
+        'skip_download': True,
+        'forcejson': True,
+        'no_warnings': True,
+        'extract_flat': False,
+        'simulate': True,
+        'playlist_items': playlist_items_str,    
+        'extractor_args': {
+            'generic': {
+                'impersonate': ['chrome']
+            },
+            'youtubetab': {
+                'skip': ['authcheck']
+            }
+        },
+        'referer': url,
+        'geo_bypass': True,
+        # check_certificate and no_check_certificates are set from user_args (default: check_certificate=False, no_check_certificates=True)
+        'live_from_start': True,
+        'socket_timeout': 60,
+    }
+
+    # Prevent yt-dlp from routing non-playlist URLs through playlist/tab
+    # extractors, which causes "No videos found in playlist" for single
+    # videos (issue #389). The download path already sets noplaylist, but
+    # this discovery function is called FIRST and must also set it.
+    from urllib.parse import urlparse as _urlparse
+    try:
+        _url_host = (_urlparse(url).hostname or '').lower()
+    except ValueError:
+        _url_host = ''
+    _is_youtube_host = (
+        _url_host == 'youtube.com'
+        or _url_host.endswith('.youtube.com')
+        or _url_host == 'youtu.be'
+        or _url_host.endswith('.youtu.be')
+    )
+    _url_lower = url.lower()
+    _is_playlist_url = (
+        ('list=' in _url_lower and _is_youtube_host)
+        or ('/playlist' in _url_lower)
+    )
+    if not _is_playlist_url:
+        ytdl_opts['noplaylist'] = True
+    
+    # Add match_filter only if domain is not in NO_FILTER_DOMAINS
+    if not is_no_filter_domain(url):
+        # Use smart filter that allows downloads when duration is unknown
+        ytdl_opts['match_filter'] = create_smart_match_filter(user_id=user_id)
+    else:
+        logger.info(safe_get_messages(user_id).YTDLP_SKIPPING_MATCH_FILTER_MSG.format(url=url))
+    
+    # Add user's custom yt-dlp arguments (but exclude format to get all available formats)
+    # This includes default values for check_certificate and no_check_certificates
+    if user_id is not None:
+        from COMMANDS.args_cmd import get_user_ytdlp_args, log_ytdlp_options
+        user_args = get_user_ytdlp_args(user_id, url)
+        if user_args:
+            # Remove format parameter to get all available formats
+            user_args_copy = user_args.copy()
+            user_args_copy.pop('format', None)
+            ytdl_opts.update(user_args_copy)
+        
+        # Log final yt-dlp options for debugging
+        log_ytdlp_options(user_id, ytdl_opts, "get_video_formats")
+    
+    if user_id is not None:
+        user_dir = os.path.join("users", str(user_id))
+        # Check the availability of cookie.txt in the user folder
+        user_cookie_path = os.path.join(user_dir, "cookie.txt")
+
+        # --- YouTube: максимально быстрый путь ---
+        # Новая логика:
+        #   1) Если у пользователя уже есть cookie.txt, считаем его рабочим
+        #      (он появился здесь только после успешной валидации ранее) и
+        #      НЕ запускаем повторно test_youtube_cookies_on_url и перебор источников.
+        #   2) Только если файла нет или он потом даст cookie‑ошибку, включается
+        #      стандартный перебор источников в retry_download_with_different_cookies.
+        if is_youtube_url(url) and not cookies_already_checked:
+            from COMMANDS.cookies_cmd import get_youtube_cookie_urls, _download_content, reset_checked_cookie_sources
+
+            if os.path.exists(user_cookie_path):
+                # Быстрый путь: просто используем уже сохранённые куки без повторной проверки
+                cookie_file = user_cookie_path
+                logger.info(
+                    safe_get_messages(user_id).YTDLP_USING_EXISTING_YOUTUBE_COOKIES_WITHOUT_RECHECK_MSG.format(
+                        user_id=user_id
+                    )
+                )
+            else:
+                # Файл куки ещё ни разу не получали — здесь действительно нужен перебор
+                reset_checked_cookie_sources(user_id)
+                logger.info(
+                    f"🔄 [DEBUG] Reset checked cookie sources for initial YouTube cookie fetch for user {user_id}"
+                )
+                cookie_urls = get_youtube_cookie_urls()
+                if cookie_urls:
+                    from COMMANDS.cookies_cmd import get_unchecked_cookie_sources, mark_cookie_source_checked, test_youtube_cookies_on_url
+                    unchecked_indices = get_unchecked_cookie_sources(user_id, cookie_urls)
+                    if not unchecked_indices:
+                        logger.warning(
+                            f"All cookie sources have been checked for user {user_id}, no more sources to try"
+                        )
+                        cookie_file = None
+                    else:
+                        success = False
+                        for i, idx in enumerate(unchecked_indices, 1):
+                            cookie_url = cookie_urls[idx]
+                            logger.info(
+                                safe_get_messages(user_id).YTDLP_TRYING_YOUTUBE_COOKIE_SOURCE_MSG.format(
+                                    i=idx + 1, user_id=user_id
+                                )
+                            )
+
+                            # Отмечаем источник как проверенный
+                            mark_cookie_source_checked(user_id, idx)
+
+                            try:
+                                ok, status_code, content, error = _download_content(cookie_url, user_id=user_id)
+                            except Exception as download_e:
+                                logger.error(
+                                    f"Error processing cookie source {idx + 1} for user {user_id}: {download_e}"
+                                )
+                                continue
+                            if ok and content and len(content) <= 100 * 1024:
+                                with open(user_cookie_path, "wb") as cf:
+                                    cf.write(content)
+                                if test_youtube_cookies_on_url(user_cookie_path, url, user_id):
+                                    cookie_file = user_cookie_path
+                                    logger.info(
+                                        safe_get_messages(user_id).YTDLP_YOUTUBE_COOKIES_FROM_SOURCE_WORK_MSG.format(
+                                            i=idx + 1, user_id=user_id
+                                        )
+                                    )
+                                    success = True
+                                    break
+                                else:
+                                    logger.warning(
+                                        safe_get_messages(
+                                            user_id
+                                        ).YTDLP_YOUTUBE_COOKIES_FROM_SOURCE_DONT_WORK_MSG.format(
+                                            i=idx + 1, user_id=user_id
+                                        )
+                                    )
+                                    if os.path.exists(user_cookie_path):
+                                        os.remove(user_cookie_path)
+                            else:
+                                logger.warning(
+                                    safe_get_messages(user_id).YTDLP_FAILED_DOWNLOAD_YOUTUBE_COOKIES_MSG.format(
+                                        i=idx + 1, user_id=user_id
+                                    )
+                                )
+
+                        if not success:
+                            logger.warning(
+                                safe_get_messages(user_id).YTDLP_ALL_YOUTUBE_COOKIE_SOURCES_FAILED_MSG.format(
+                                    user_id=user_id
+                                )
+                            )
+                            cookie_file = None
+                else:
+                    logger.warning(
+                        safe_get_messages(user_id).YTDLP_NO_YOUTUBE_COOKIE_SOURCES_CONFIGURED_MSG.format(
+                            user_id=user_id
+                        )
+                    )
+                    cookie_file = None
+        elif is_youtube_url(url) and cookies_already_checked:
+            # Cookies already checked in Always Ask menu - use them directly without verification
+            if os.path.exists(user_cookie_path):
+                cookie_file = user_cookie_path
+                logger.info(safe_get_messages(user_id).YTDLP_USING_YOUTUBE_COOKIES_ALREADY_VALIDATED_MSG.format(user_id=user_id))
+            else:
+                # Cookies were deleted - try to restore them on user's URL
+                logger.info(safe_get_messages(user_id).YTDLP_NO_YOUTUBE_COOKIES_FOUND_ATTEMPTING_RESTORE_MSG.format(user_id=user_id))
+                from COMMANDS.cookies_cmd import get_youtube_cookie_urls, test_youtube_cookies_on_url, _download_content
+                cookie_urls = get_youtube_cookie_urls()
+                if cookie_urls:
+                    success = False
+                    for i, cookie_url in enumerate(cookie_urls, 1):
+                        logger.info(f"Trying YouTube cookie source {i} for format detection for user {user_id}")
+                        try:
+                            ok, status_code, content, error = _download_content(cookie_url, user_id=user_id)
+                        except Exception as download_e:
+                            logger.error(f"Error processing cookie source {i} for user {user_id}: {download_e}")
+                            continue
+                        if ok and content and len(content) <= 100 * 1024:
+                            with open(user_cookie_path, "wb") as cf:
+                                cf.write(content)
+                            if test_youtube_cookies_on_url(user_cookie_path, url, user_id):
+                                cookie_file = user_cookie_path
+                                logger.info(f"YouTube cookies from source {i} work on user's URL for format detection for user {user_id} - saved to user folder")
+                                success = True
+                                break
+                            else:
+                                logger.warning(f"YouTube cookies from source {i} don't work on user's URL for format detection for user {user_id}")
+                                if os.path.exists(user_cookie_path):
+                                    os.remove(user_cookie_path)
+                        else:
+                            logger.warning(f"Failed to download YouTube cookies from source {i} for format detection for user {user_id}")
+                    
+                    if not success:
+                        logger.warning(f"All YouTube cookie sources failed for format detection for user {user_id}, will try without cookies")
+                        cookie_file = None
+                else:
+                    logger.warning(f"No YouTube cookie sources configured for format detection for user {user_id}, will try without cookies")
+                    cookie_file = None
+        else:
+            # For non-YouTube URLs, use new cookie fallback system
+            # Для Instagram / Facebook / TikTok / VK действуем по схеме:
+            #   1) сначала пробуем БЕЗ куки;
+            #   2) если не получилось — пробуем куки пользователя;
+            #   3) если и это не помогло — берём куки по URL из конфига.
+            # Для остальных доменов остаётся старая логика с кешом.
+            from COMMANDS.cookies_cmd import get_cookie_cache_result, try_non_youtube_cookie_fallback, get_service_name_from_url
+
+            service_name = get_service_name_from_url(url)
+            special_social = service_name in {"instagram", "facebook", "tiktok", "vk"}
+
+            if special_social:
+                # Стартуем максимально быстро: без куки.
+                cookie_file = None
+                logger.info(f"Using NO cookies for initial format detection on {service_name}: {url}")
+            else:
+                cache_result = get_cookie_cache_result(user_id, url)
+                
+                if cache_result and cache_result['result']:
+                    # Use cached successful cookies
+                    cookie_file = cache_result['cookie_path']
+                    logger.info(f"Using cached cookies for non-YouTube format detection: {url}")
+                else:
+                    # Try user cookies first
+                    if os.path.exists(user_cookie_path):
+                        cookie_file = user_cookie_path
+                        logger.info(f"Using user cookies for non-YouTube format detection: {url}")
+                    else:
+                        # No user cookies, will try fallback during format detection
+                        cookie_file = None
+                        logger.info(f"No user cookies found for non-YouTube format detection: {url}, will try fallback")
+        
+        # We check whether to use —no-Cookies for this domain
+        if is_no_cookie_domain(url):
+            ytdl_opts['cookiefile'] = None  # Equivalent-No-Cookies
+            logger.info(safe_get_messages(user_id).YTDLP_USING_NO_COOKIES_FOR_DOMAIN_MSG.format(url=url))
+        elif cookie_file:
+            ytdl_opts['cookiefile'] = cookie_file
+            logger.info(f"[YTDLP DEBUG] Using cookies for {url}: {cookie_file}")
+        else:
+            logger.info(f"[YTDLP DEBUG] No cookies available for {url}")
+        
+    # Proxy: same logic as /vid /audio /link (country / AUTO / domain)
+    from HELPERS.proxy_helper import add_proxy_to_ytdl_opts
+    ytdl_opts = add_proxy_to_ytdl_opts(ytdl_opts, url, user_id)
+    
+    # Add PO token provider for YouTube domains
+    ytdl_opts = add_pot_to_ytdl_opts(ytdl_opts, url)
+    # Как в down_and_up: явный Node, иначе user_args могут подставить deno/none и format-check даст FORMAT_NOT_AVAILABLE
+    ytdl_opts['js_runtimes'] = {'node': {}}
+
+    # Try with proxy fallback if user proxy is enabled
+    def extract_info_operation(opts):
+        try:
+            logger.info(f"🔍 [DEBUG] extract_info_operation: начинаем извлечение информации")
+            logger.info(f"   url: {url}")
+            logger.info(f"   opts keys: {list(opts.keys())}")
+            
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            
+            logger.info(f"✅ [DEBUG] extract_info_operation: извлечение завершено")
+            logger.info(f"   info type: {type(info)}")
+            if isinstance(info, dict):
+                logger.info(f"   info keys: {list(info.keys())}")
+                if 'duration' in info:
+                    logger.info(f"   duration: {info['duration']} (тип: {type(info['duration'])})")
+                if 'is_live' in info:
+                    logger.info(f"   is_live: {info['is_live']} (тип: {type(info['is_live'])})")
+            
+            # Normalize info to a dict
+            # Для плейлистов сохраняем все entries для скачивания обложек
+            playlist_entries = None
+            if isinstance(info, list):
+                info = (info[0] if len(info) > 0 else {})
+                logger.info(f"🔍 [DEBUG] info был списком, взяли первый элемент")
+            elif isinstance(info, dict) and 'entries' in info:
+                entries = info.get('entries')
+                if isinstance(entries, list) and len(entries) > 0:
+                    # Сохраняем все entries для скачивания обложек
+                    playlist_entries = entries
+                    info = entries[0]
+                    logger.info(f"🔍 [DEBUG] info содержал entries, взяли первый элемент. Всего entries: {len(entries)}")
+                    # Добавляем entries в info для использования в ask_quality_menu
+                    info['_playlist_entries'] = playlist_entries
+            
+            # Check for live stream after extraction (only if detection is enabled)
+            if info and info.get('is_live', False) and LimitsConfig.ENABLE_LIVE_STREAM_BLOCKING:
+                logger.warning(f"Live stream detected in get_video_formats: {url}")
+                return {'error': 'LIVE_STREAM_DETECTED'}
+            
+            # Cache successful cookie result for future use
+            if not is_youtube_url(url) and user_id is not None:
+                from COMMANDS.cookies_cmd import set_cookie_cache_result
+                cookie_file_path = opts.get('cookiefile')
+                if cookie_file_path and os.path.exists(cookie_file_path):
+                    set_cookie_cache_result(user_id, url, True, cookie_file_path)
+                    logger.info(f"Cached successful cookie result for format detection {url}")
+            
+            logger.info(f"✅ [DEBUG] extract_info_operation: возвращаем info")
+            return info
+        except yt_dlp.utils.DownloadError as e:
+            error_text = str(e)
+            logger.error(f"DownloadError in get_video_formats: {error_text}")
+            _error_lower = error_text.lower()
+
+            # Check for live stream detection (only if detection is enabled)
+            if "LIVE_STREAM_DETECTED" in error_text and LimitsConfig.ENABLE_LIVE_STREAM_BLOCKING:
+                return {'error': 'LIVE_STREAM_DETECTED'}
+
+            # Permanent, non-transient errors: abort immediately instead of running
+            # expensive proxy/impersonate retry storms (issues #323, #329, #330).
+            if _is_rate_limited(_error_lower):
+                logger.warning(f"Rate-limit detected, aborting retries for {url}: {error_text[:200]}")
+                return {'error': 'RATE_LIMITED', 'original_error': error_text}
+
+            if _is_permanent_unavailable(_error_lower):
+                logger.warning(f"Permanent unavailable error, no retries for {url}: {error_text[:200]}")
+                return {'error': 'PERMANENT_UNAVAILABLE', 'original_error': error_text}
+
+            # Transient network timeout (issue #464): retry once with a longer
+            # socket_timeout before any proxy/cookie fallback — the endpoint is
+            # usually reachable again immediately after a single read timeout.
+            if _is_transient_network_timeout(_error_lower):
+                retry_opts = opts.copy()
+                _base_to = opts.get('socket_timeout') or 60
+                retry_opts['socket_timeout'] = max(120, int(_base_to) * 2)
+                logger.warning(
+                    f"Transient network timeout, retrying with socket_timeout="
+                    f"{retry_opts['socket_timeout']}s for {url}: {error_text[:200]}"
+                )
+                try:
+                    retry_result = extract_info_operation(retry_opts)
+                    if retry_result is not None:
+                        logger.info(f"Retry after network timeout successful for {url}")
+                        return retry_result
+                except Exception as retry_e:
+                    logger.warning(f"Retry after network timeout also failed for {url}: {retry_e}")
+
+            # Auto-retry: --live-from-start fails for non-live streams on VK and
+            # other platforms. Retry with live_from_start=False (issue #80/vk).
+            if "--live-from-start is passed, but there are no formats that can be downloaded from the start" in error_text:
+                logger.info(f"live-from-start not supported for this URL, retrying with --no-live-from-start: {url}")
+                retry_opts = opts.copy()
+                retry_opts['live_from_start'] = False
+                try:
+                    retry_result = extract_info_operation(retry_opts)
+                    if retry_result is not None:
+                        logger.info(f"Retry with --no-live-from-start successful for {url}")
+                        return retry_result
+                except Exception as retry_e:
+                    logger.warning(f"Retry with --no-live-from-start also failed for {url}: {retry_e}")
+
+            # Unsupported URL: only allow gallery-dl fallback (non-YouTube); otherwise bail out
+            # without proxy/impersonate retries which cannot help unsupported domains (issue #323).
+            if 'unsupported url' in _error_lower:
+                if gallery_dl_has_extractor(url) and should_fallback_to_gallery_dl(error_text, url):
+                    logger.info(f"Unsupported URL — deferring to gallery-dl fallback for {url}")
+                    return {'error': 'FALLBACK_TO_GALLERY_DL', 'original_error': error_text}
+                logger.warning(f"Unsupported URL (no yt-dlp or gallery-dl extractor), no retries for {url}: {error_text[:200]}")
+                return {'error': 'UNSUPPORTED_URL', 'original_error': error_text}
+
+            # Check for YouTube cookie errors and try automatic retry
+            if is_youtube_url(url) and user_id is not None:
+                from COMMANDS.cookies_cmd import is_youtube_cookie_error, is_youtube_geo_error, retry_download_with_different_cookies, retry_download_with_proxy
+                
+                if is_youtube_cookie_error(error_text):
+                    logger.info(f"YouTube cookie error detected in get_video_formats for user {user_id}, attempting automatic retry")
+                    
+                    # Try retry with different cookies
+                    retry_result = retry_download_with_different_cookies(
+                        user_id, url, extract_info_operation, opts
+                    )
+                    
+                    if retry_result is not None:
+                        logger.info(f"get_video_formats retry with different cookies successful for user {user_id}")
+                        return retry_result
+                    else:
+                        logger.warning(f"All cookie retry attempts failed in get_video_formats for user {user_id}")
+                
+                # Note: Geo errors are handled at the outer level (before try_with_proxy_fallback)
+                # to ensure proxy from file is tried first
+            elif not is_youtube_url(url) and user_id is not None:
+                # For non-YouTube sites, try cookie fallback
+                logger.info(f"Non-YouTube error detected in get_video_formats for user {user_id}, attempting cookie fallback")
+
+                # Check if error is cookie-related
+                error_str = error_text.lower()
+                # HTTP 401 from access-restricted hosts (Dailymotion/Vimeo) is a permanent
+                # access-denied/API change, NOT a cookie problem — skip cookie fallback to avoid
+                # a 4-strategy retry storm that just re-receives 401 (issue #318).
+                _host = ''
+                try:
+                    from urllib.parse import urlparse
+                    _host = (urlparse(url).hostname or '').lower()
+                except Exception:
+                    pass
+                _access_denied_host = any(h in _host for h in ('dailymotion.com', 'vimeo.com'))
+                if _access_denied_host and ('401' in error_str or 'unauthorized' in error_str):
+                    logger.info(f"401/Unauthorized from access-restricted host {_host} for {url} — skipping cookie fallback (permanent access error)")
+                elif any(keyword in error_str for keyword in ['cookie', 'auth', 'login', 'sign in', '403', '401', 'forbidden', 'unauthorized']):
+                    logger.info(f"Error appears to be cookie-related for {url}, trying cookie fallback")
+                    
+                    # Try cookie fallback with new system
+                    from COMMANDS.cookies_cmd import try_non_youtube_cookie_fallback
+                    retry_result = try_non_youtube_cookie_fallback(
+                        user_id, url, extract_info_operation, opts
+                    )
+                    
+                    if retry_result is not None:
+                        logger.info(f"get_video_formats retry with cookie fallback successful for user {user_id}")
+                        return retry_result
+                    else:
+                        logger.warning(f"get_video_formats retry with cookie fallback failed for user {user_id}")
+                else:
+                    logger.info(f"Error appears to be non-cookie-related for {url}, skipping cookie fallback")
+            
+            # Check for TikTok private account error
+            # Безопасная проверка домена через urlparse
+            is_tiktok = False
+            try:
+                from urllib.parse import urlparse
+                parsed_url = urlparse(url)
+                tiktok_hostname = (parsed_url.hostname or '').lower()
+                is_tiktok = tiktok_hostname in ('tiktok.com', 'www.tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com') or \
+                           tiktok_hostname.endswith('.tiktok.com')
+            except Exception:
+                pass
+            
+            if is_tiktok and "private" in error_text.lower() and "account" in error_text.lower():
+                logger.info(f"TikTok private account detected for {url}, recommending gallery-dl fallback")
+                return {'error': 'TIKTOK_PRIVATE_ACCOUNT', 'original_error': error_text}
+            
+            # Check if we should fallback to gallery-dl
+            if should_fallback_to_gallery_dl(error_text, url):
+                logger.info(f"Fallback to gallery-dl recommended for {url} due to error: {error_text[:200]}...")
+                return {'error': 'FALLBACK_TO_GALLERY_DL', 'original_error': error_text}
+            
+            # Check for Cloudflare errors and try impersonate fallback
+            from HELPERS.proxy_helper import is_cloudflare_error
+            if is_cloudflare_error(error_text):
+                logger.info(f"Cloudflare error detected for {url}, will try impersonate fallback")
+                # Store the error to handle it in the outer scope
+                raise e
+            
+            # Re-raise other DownloadErrors
+            raise e
+        except Exception as e:
+            error_text = str(e)
+            # Check if it's a Cloudflare error
+            from HELPERS.proxy_helper import is_cloudflare_error, try_with_impersonate_fallback
+            if is_cloudflare_error(error_text):
+                logger.info(f"Cloudflare error detected for {url}, trying impersonate fallback")
+                # Try with different impersonate versions
+                impersonate_result = try_with_impersonate_fallback(ytdl_opts, url, user_id, extract_info_operation)
+                if impersonate_result is not None:
+                    return impersonate_result
+                logger.warning(f"All impersonate versions failed for {url}, trying proxy fallback")
+            
+            logger.error(f"Error extracting info for {url}: {e}")
+            # yt-dlp can raise non-DownloadError exceptions during extraction
+            # (e.g. an internal TypeError when the GoogleDriveFolder extractor
+            # feeds a bool from _download_webpage(fatal=False) into re.search on
+            # folder URLs). Returning a structured error dict instead of
+            # re-raising lets callers show a clean user-facing message instead of
+            # crashing the bot (issue #380).
+            return {'error': 'EXTRACTION_ERROR', 'original_error': error_text}
+    
+    from HELPERS.proxy_helper import try_with_proxy_fallback, try_with_impersonate_fallback, is_cloudflare_error
+    
+    # First, try to extract info
+    try:
+        result = extract_info_operation(ytdl_opts)
+        if result is not None:
+            return result
+    except yt_dlp.utils.DownloadError as e:
+        error_text = str(e)
+        
+        # Check for YouTube geo errors BEFORE trying proxy fallback
+        if is_youtube_url(url) and user_id is not None:
+            from COMMANDS.cookies_cmd import is_youtube_geo_error, retry_download_with_proxy
+            
+            if is_youtube_geo_error(error_text):
+                logger.info(f"YouTube geo-blocked error detected in get_video_formats for user {user_id}, attempting retry with proxy from file")
+                
+                # Try retry with proxy from file
+                # extract_info_operation takes opts as single argument, so we need to wrap it
+                # retry_download_with_proxy expects (url, attempt_opts) format, so we create a wrapper
+                def extract_with_attempt_opts(url_arg, attempt_opts_dict):
+                    # Use attempt_opts_dict (which includes proxy) instead of original opts
+                    # Убеждаемся, что geo_bypass включен для обхода геоблокировки
+                    if 'geo_bypass' not in attempt_opts_dict:
+                        attempt_opts_dict['geo_bypass'] = True
+                    logger.info(f"extract_with_attempt_opts: proxy={attempt_opts_dict.get('proxy', 'None')}, geo_bypass={attempt_opts_dict.get('geo_bypass', 'None')}, cookiefile={'set' if attempt_opts_dict.get('cookiefile') else 'None'}")
+                    return extract_info_operation(attempt_opts_dict)
+                
+                retry_result = retry_download_with_proxy(
+                    user_id, url, extract_with_attempt_opts, url, ytdl_opts, error_message=error_text
+                )
+                
+                if retry_result is not None:
+                    logger.info(f"get_video_formats retry with proxy from file successful for user {user_id}")
+                    return retry_result
+                else:
+                    logger.warning(f"get_video_formats retry with proxy from file failed for user {user_id}")
+    
+    # If geo retry failed or wasn't applicable, try with proxy fallback from config
+    result = try_with_proxy_fallback(ytdl_opts, url, user_id, extract_info_operation)
+    if result is None:
+        # If proxy fallback failed, check if it was a Cloudflare error and try impersonate fallback
+        try:
+            # Try once more to capture the error
+            extract_info_operation(ytdl_opts)
+        except Exception as e:
+            error_text = str(e)
+            if is_cloudflare_error(error_text):
+                logger.info(f"Cloudflare error detected after proxy fallback for {url}, trying impersonate fallback")
+                impersonate_result = try_with_impersonate_fallback(ytdl_opts, url, user_id, extract_info_operation)
+                if impersonate_result is not None:
+                    return impersonate_result
+        
+        return {'error': 'Failed to extract video information with all available proxies'}
+    return result
+
+
+# YT-DLP HOOK
+
+def ytdlp_hook(d):
+    logger.info(d['status'])

@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+# Version 1.0.2 (with NEED_BACKUP toggle)
+"""
+Script to automatically update code from a GitHub repository.
+Clones the repository into a temporary folder and replaces required files.
+"""
+
+import os
+import sys
+import shutil
+import tempfile
+import subprocess
+from pathlib import Path
+from datetime import datetime
+
+# This script lives in <project_root>/scripts/. Resolve the project root (one
+# level up), put it on sys.path (so `from CONFIG...` imports resolve) and chdir
+# there: the updater clones the repo and copies files relative to the project
+# root (magic.py sanity check, CONFIG/LANGUAGES creation, find . -name backup, etc.).
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(PROJECT_ROOT)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from CONFIG.messages import Messages, safe_get_messages
+
+# =====================================================
+# NEW: Backup toggle (1 = enable backups, 0 = skip)
+# =====================================================
+NEED_BACKUP = 1
+
+# Configuration
+REPO_URL = "https://github.com/chelaxian/tg-ytdlp-bot.git"
+# Use explicit branch
+# BRANCH = "newdesign2"
+BRANCH = "main"
+
+EXCLUDED_FILES = [
+    "CONFIG/domains.py",
+    "CONFIG/config.py",
+    ".env",
+    ".bot_pid",
+    "bot.log",
+    "runtime.log",
+    "magic.session",
+    "magic.session-journal",
+    "dump.json",
+    "script.sh",
+]
+
+EXCLUDED_DIRS = [
+    "venv",
+    ".git",
+    "__pycache__",
+    "_backup",
+    "users",
+    "cookies",
+    "TXT",
+    "_arabic_fonts_amiri",
+    "_cursor",
+]
+
+INCLUDE_DIRS = [
+    "web",
+]
+
+ALWAYS_INCLUDE_FILES = [
+    "requirements.txt",
+    # Docker files
+    "Dockerfile",
+    "docker-compose.yml",
+    ".dockerignore",
+    "scripts/docker-entrypoint.sh",
+    # Update / maintenance scripts (live under scripts/)
+    "scripts/UPDATE.sh",
+    "scripts/UPDATE_DOCKER.sh",
+    "scripts/engines_updater.sh",
+    "scripts/update_bgutil_provider.sh",
+    "scripts/update_from_repo.py",
+    "scripts/create_backup.py",
+    "scripts/restore_from_backup.py",
+    "scripts/generate_session_string.py",
+    "scripts/clean_fire_logs.py",
+    # Other important files
+    "README.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+]
+
+
+def log(message, level="INFO"):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {level}: {message}")
+
+
+def _is_inside(path: str, directory: str) -> bool:
+    return path == directory or path.startswith(f"{directory}/")
+
+
+def should_update_file(file_path, exclude_include_dirs=False):
+    for excluded in EXCLUDED_FILES:
+        if file_path == excluded:
+            return False
+
+    for excluded_dir in EXCLUDED_DIRS:
+        if _is_inside(file_path, excluded_dir):
+            return False
+
+    if exclude_include_dirs:
+        for include_dir in INCLUDE_DIRS:
+            if _is_inside(file_path, include_dir):
+                return False
+
+    if file_path in ALWAYS_INCLUDE_FILES:
+        return True
+
+    if not exclude_include_dirs:
+        for include_dir in INCLUDE_DIRS:
+            if _is_inside(file_path, include_dir):
+                return True
+
+    if file_path.endswith('.py'):
+        return True
+
+    if file_path.startswith('CONFIG/LANGUAGES/'):
+        return True
+
+    # Include shell scripts (except script.sh which is in EXCLUDED_FILES)
+    if file_path.endswith('.sh') and file_path not in EXCLUDED_FILES:
+        return True
+
+    # Include Docker-related files (including files in warp/ subdirectory)
+    if file_path in ['Dockerfile', 'docker-compose.yml', '.dockerignore', 'scripts/docker-entrypoint.sh']:
+        return True
+    if file_path.startswith('warp/'):
+        # Include all files in warp/ directory (Dockerfile, .sh scripts, .dockerignore)
+        if file_path.endswith('Dockerfile') or file_path.endswith('.sh') or file_path.endswith('.dockerignore'):
+            return True
+
+    # Include documentation files
+    if file_path.endswith('.md') and file_path not in EXCLUDED_FILES:
+        return True
+
+    # Include license file
+    if file_path == 'LICENSE':
+        return True
+
+    return False
+
+
+# =====================================================
+# UPDATED: backup_file now respects NEED_BACKUP
+# =====================================================
+def backup_file(file_path):
+    """Create a backup copy of a file, unless backups are disabled"""
+    if not NEED_BACKUP:
+        return None
+
+    try:
+        if os.path.exists(file_path):
+            backup_ts = datetime.now().strftime('%Y%m%d_%H%M')
+            backup_path = f"{file_path}.backup_{backup_ts}"
+            shutil.copy2(file_path, backup_path)
+            log(f"Backup created: {backup_path}")
+            return backup_path
+    except Exception as e:
+        log(f"Error creating backup for {file_path}: {e}", "ERROR")
+    return None
+
+
+def clone_repository(temp_dir):
+    messages = safe_get_messages(None)
+    try:
+        log(f"📥 Cloning repository into {temp_dir}...")
+
+        cmd = [
+            'git', 'clone',
+            '--branch', BRANCH,
+            '--depth', '1',
+            '--single-branch',
+            REPO_URL,
+            temp_dir
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+        if result.returncode == 0:
+            messages = safe_get_messages()
+            log(messages.UPDATE_REPOSITORY_CLONED_SUCCESS_MSG)
+            return True
+        else:
+            messages = safe_get_messages()
+            log(messages.UPDATE_CLONE_ERROR_MSG.format(error=result.stderr), "ERROR")
+            return False
+
+    except subprocess.TimeoutExpired:
+        messages = safe_get_messages()
+        log(messages.UPDATE_CLONE_TIMEOUT_MSG, "ERROR")
+        return False
+    except Exception as e:
+        messages = safe_get_messages()
+        log(messages.UPDATE_CLONE_EXCEPTION_MSG.format(error=e), "ERROR")
+        return False
+
+
+def find_python_files(source_dir, exclude_include_dirs=False):
+    files_to_update = []
+
+    for root, dirs, files in os.walk(source_dir):
+        dirs[:] = [d for d in dirs if d not in ['.git', '__pycache__', 'venv']]
+
+        if exclude_include_dirs:
+            for include_dir in INCLUDE_DIRS:
+                if include_dir in dirs:
+                    dirs.remove(include_dir)
+
+        for file in files:
+            rel_path = os.path.relpath(os.path.join(root, file), source_dir)
+            if should_update_file(rel_path, exclude_include_dirs=exclude_include_dirs):
+                files_to_update.append(rel_path)
+
+    return sorted(files_to_update)
+
+
+def sync_include_directories(source_root: str) -> None:
+    for include_dir in INCLUDE_DIRS:
+        source_path = os.path.join(source_root, include_dir)
+        if not os.path.exists(source_path):
+            log(f"⚠️ Include directory missing in repo: {include_dir}", "WARNING")
+            continue
+
+        target_path = Path(include_dir)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        file_count = 0
+        if target_path.exists():
+            for root, dirs, files in os.walk(target_path):
+                file_count += len(files)
+            log(f"🧹 Removing existing directory: {include_dir} ({file_count} files)")
+            shutil.rmtree(target_path)
+
+        files_to_copy = []
+        for root, dirs, files in os.walk(source_path):
+            for file in files:
+                rel_path = os.path.relpath(os.path.join(root, file), source_path)
+                files_to_copy.append(rel_path)
+
+        log(f"📦 Syncing directory: {include_dir} ({len(files_to_copy)} files)")
+        shutil.copytree(source_path, target_path)
+        log(f"✅ Successfully synced {include_dir}: {len(files_to_copy)} files updated")
+
+
+# =====================================================
+# UPDATED: backup skipped when NEED_BACKUP = 0
+# =====================================================
+def update_file_from_source(source_file, target_file):
+    try:
+        dir_name = os.path.dirname(target_file)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+            log(f"📁 Created directory: {dir_name}")
+
+        backup_path = backup_file(target_file)
+
+        shutil.copy2(source_file, target_file)
+
+        log(f"Updated file: {target_file}")
+        if backup_path and NEED_BACKUP:
+            log(f"Backup: {backup_path}")
+
+        return True
+    except Exception as e:
+        log(f"Error updating file {target_file}: {e}", "ERROR")
+        return False
+
+
+# =====================================================
+# UPDATED: move backups only if NEED_BACKUP = 1
+# =====================================================
+def move_backups_to_backup_dir():
+    if not NEED_BACKUP:
+        return
+
+    messages = safe_get_messages(None)
+
+    try:
+        log("📦 Moving backups to _backup/...")
+        cmd = (
+            "mkdir -p _backup && "
+            "find . -path './_backup' -prune -o -type f -name \"*.backup*\" -print0 "
+            "| sed -z 's#^\\./##' "
+            "| rsync -a --relative --from0 --files-from=- --remove-source-files ./ _backup/"
+        )
+        subprocess.run(["bash", "-lc", cmd], check=True, timeout=600)
+        messages = safe_get_messages()
+        log(messages.UPDATE_BACKUPS_MOVED_MSG)
+    except Exception as e:
+        log(f"⚠️ Failed to move backups: {e}", "WARNING")
+
+
+def set_executable_flag_for_shell_scripts(base_dir: Path) -> None:
+    """
+    Гарантирует, что все *.sh скрипты имеют бит выполнения после обновления.
+    Это полезно, когда код редактируется под Windows и права исполняемых файлов теряются.
+    """
+    try:
+        for root, dirs, files in os.walk(base_dir):
+            # Пропускаем служебные директории
+            rel_root = os.path.relpath(root, base_dir)
+            if rel_root == ".":
+                rel_root = ""
+            skip_dir = False
+            for excluded_dir in EXCLUDED_DIRS:
+                if rel_root and rel_root.startswith(excluded_dir):
+                    skip_dir = True
+                    break
+            if skip_dir:
+                continue
+
+            for filename in files:
+                if not filename.endswith(".sh"):
+                    continue
+                rel_path = os.path.join(rel_root, filename) if rel_root else filename
+                # Не трогаем явно исключённые скрипты (например, script.sh)
+                if rel_path in EXCLUDED_FILES:
+                    continue
+                full_path = base_dir / rel_path
+                try:
+                    mode = full_path.stat().st_mode
+                    # Добавляем execute-бит для owner/group/others
+                    full_path.chmod(mode | 0o111)
+                except Exception as chmod_err:
+                    log(f"⚠️ Failed to set executable flag on {full_path}: {chmod_err}", "WARNING")
+        log("✅ Executable flag applied to all .sh scripts")
+    except Exception as e:
+        log(f"⚠️ Failed to process shell scripts permissions: {e}", "WARNING")
+
+def main():
+    messages = safe_get_messages(None)
+
+    log("🚀 Starting update from GitHub repository")
+    log(f"Repository: {REPO_URL}")
+    log(f"Branch: {BRANCH}")
+    log(f"NEED_BACKUP = {NEED_BACKUP}")
+
+    if not os.path.exists("magic.py"):
+        log("❌ File magic.py not found. Make sure you run this in the bot folder.", "ERROR")
+        return False
+
+    languages_dir = "CONFIG/LANGUAGES"
+    if not os.path.exists(languages_dir):
+        try:
+            os.makedirs(languages_dir, exist_ok=True)
+            log(f"📁 Created LANGUAGES directory: {languages_dir}")
+        except Exception as e:
+            log(f"⚠️ Failed to create LANGUAGES directory: {e}", "WARNING")
+
+    if not shutil.which('git'):
+        log("❌ Git not found. Please install Git to use this updater.", "ERROR")
+        return False
+
+    temp_dir = None
+    try:
+        temp_dir = tempfile.mkdtemp(prefix="tg-ytdlp-update-")
+        log(f"📁 Temporary directory created: {temp_dir}")
+
+        if not clone_repository(temp_dir):
+            return False
+
+        files_to_update = find_python_files(temp_dir, exclude_include_dirs=True)
+
+        if not files_to_update:
+            log("❌ No files found to update", "ERROR")
+            return False
+
+        log(f"📋 Found {len(files_to_update)} files to update")
+        log("📝 Files to update:")
+        for file_path in files_to_update:
+            log(f"  - {file_path}")
+
+        response = input("\n🤔 Proceed with update? (y/N): ").strip().lower()
+        if response not in ['y', 'yes']:
+            messages = safe_get_messages()
+            log(messages.UPDATE_CANCELED_BY_USER_MSG)
+            return False
+
+        updated_count = 0
+        failed_count = 0
+
+        for file_path in files_to_update:
+            log(f"🔄 Updating {file_path}...")
+            source_file = os.path.join(temp_dir, file_path)
+            target_file = file_path
+
+            if update_file_from_source(source_file, target_file):
+                updated_count += 1
+            else:
+                failed_count += 1
+
+        log("=" * 50)
+        log("📊 Update results:")
+        log(f"✅ Successfully updated: {updated_count}")
+        log(f"❌ Errors: {failed_count}")
+        log(f"📁 Total files: {len(files_to_update)}")
+
+        log("=" * 50)
+        log("📦 Syncing include directories (web/, etc.)...")
+        sync_include_directories(temp_dir)
+
+        # После обновления файлов и синхронизации директорий восстанавливаем
+        # права исполнения для всех shell-скриптов в рабочем каталоге.
+        set_executable_flag_for_shell_scripts(Path('.'))
+
+        # ============================
+        # NEW: backup skip logic here
+        # ============================
+        if NEED_BACKUP:
+            move_backups_to_backup_dir()
+        else:
+            log("⏭ Backup disabled: skipping backup aggregation step")
+
+        if failed_count == 0:
+            log("🎉 All files updated successfully!")
+            return True
+        else:
+            log(f"⚠️ Updated with errors: {failed_count} files", "WARNING")
+            return False
+
+    except Exception as e:
+        log(f"❌ Critical error: {e}", "ERROR")
+        return False
+
+    finally:
+        if temp_dir and os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+                log(f"🗑️ Temporary directory removed: {temp_dir}")
+            except Exception as e:
+                log(f"⚠️ Failed to remove temporary directory: {e}", "WARNING")
+
+
+def show_excluded_files():
+    log("📋 Excluded files:")
+    for file_path in EXCLUDED_FILES:
+        log(f"  - {file_path}")
+
+    log("📁 Excluded directories:")
+    for dir_path in EXCLUDED_DIRS:
+        log(f"  - {dir_path}/")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--show-excluded":
+        show_excluded_files()
+    else:
+        success = main()
+        sys.exit(0 if success else 1)

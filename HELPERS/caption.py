@@ -1,0 +1,217 @@
+# Caption Editor for Videos
+import re
+from typing import Tuple
+from CONFIG.config import Config
+from CONFIG.messages import Messages, safe_get_messages
+from HELPERS.app_instance import get_app
+from HELPERS.logger import send_to_logger
+from pyrogram import filters
+
+# Get app instance for decorators
+app = get_app()
+
+
+# Standard resolution sides (p) used in practice; quality = exact match of either width or height
+_STANDARD_QUALITIES = {144, 240, 360, 480, 576, 720, 1080, 1440, 2160, 4320}
+# Short names in parentheses: SD, HD, Full HD, QHD, 4K, 8K
+_QUALITY_HINT = {
+    480: "SD",
+    576: "SD",
+    720: "HD",
+    1080: "Full HD",
+    1440: "QHD",
+    2160: "4K",
+    4320: "8K",
+}
+
+
+def format_quality_codec(height=None, width=None, vcodec=None, dynamic_range=None):
+    """
+    Build suffix string for caption: quality (144p–4320p) and codec (AV1, AVC1, VP9).
+    Quality = whichever of width/height exactly matches a standard value (144, 240, 360, 480, 720, 1080, …).
+    E.g. 1920x1080 → 1080p, 1080x1920 → 1080p. If both match, use the minimum (e.g. 1080×720 → 720p).
+    Hints in parentheses: SD, HD, Full HD, QHD, 4K, 8K.
+    If dynamic_range == "hdr" (case-insensitive), appends HDR tag.
+    Returns e.g. " 📹1080P(Full HD) 📼AV1 📺HDR" or " 📹4320p(8K) 📼VP9 📺HDR" or similar.
+    """
+    parts = []
+    try:
+        h = int(height) if height is not None else None
+        w = int(width) if width is not None else None
+        if h is not None or w is not None:
+            candidates = [s for s in (h, w) if s is not None and s in _STANDARD_QUALITIES]
+            quality_side = min(candidates) if candidates else (min(h, w) if (h is not None and w is not None) else (h or w))
+        else:
+            quality_side = None
+        if quality_side is not None:
+            hint = _QUALITY_HINT.get(quality_side)
+            p_label = f"📹{quality_side}p" if quality_side >= 2160 else f"📹{quality_side}P"
+            parts.append(f"{p_label}({hint})" if hint else p_label)
+    except (TypeError, ValueError):
+        pass
+    if vcodec:
+        v = (vcodec or "").strip().lower()
+        is_hdr = dynamic_range and str(dynamic_range).lower() == "hdr"
+        if "av01" in v or v == "av1":
+            codec_display = "AV1" if not is_hdr else "AV1 (HDR)"
+        elif "avc1" in v or "h264" in v or "avc" in v:
+            codec_display = "AVC1" if not is_hdr else "AVC1 (HDR)"
+        elif "vp9" in v:
+            codec_display = "VP9" if not is_hdr else "VP9 (HDR)"
+        elif "hevc" in v or "h265" in v:
+            codec_display = "HEVC" if not is_hdr else "HEVC (HDR)"
+        else:
+            codec_display = v[:4].upper() if len(v) >= 4 else v.upper()
+        if codec_display:
+            parts.append(f"📼{codec_display}")
+    return (" " + " ".join(parts)) if parts else ""
+
+
+# Called from url_distractor - no decorator needed
+def caption_editor(app, message):
+    messages = safe_get_messages(message.chat.id)
+    # Проверяем, что сообщение является ответом на видео
+    if not message.reply_to_message or not message.reply_to_message.video:
+        return
+    
+    try:
+        users_name = message.chat.first_name
+        user_id = message.chat.id
+        caption = message.text
+        video_file_id = message.reply_to_message.video.file_id
+        info_of_video = safe_get_messages(user_id).CAPTION_INFO_OF_VIDEO_MSG.format(caption=caption, user_id=user_id, users_name=users_name, video_file_id=video_file_id)
+        # Sending to logs
+        send_to_logger(message, info_of_video)
+        app.send_video(user_id, video_file_id, caption=caption)
+        from HELPERS.logger import get_log_channel
+        app.send_video(get_log_channel("video"), video_file_id, caption=caption)
+    except AttributeError as e:
+        # Логируем ошибку, но не прерываем работу бота
+        from HELPERS.logger import logger
+        logger.error(safe_get_messages(user_id).CAPTION_ERROR_IN_CAPTION_EDITOR_MSG.format(error=e))
+        return
+    except Exception as e:
+        # Логируем любые другие ошибки
+        from HELPERS.logger import logger
+        logger.error(safe_get_messages(user_id).CAPTION_UNEXPECTED_ERROR_IN_CAPTION_EDITOR_MSG.format(error=e))
+        return
+
+
+def truncate_caption(
+    title: str,
+    description: str,
+    url: str,
+    tags_text: str = '',
+    max_length: int = 1000,  # Reduced from 1024 to be safe with encoding issues
+    user_id: int = None,
+    quality_codec_suffix: str = '',
+) -> Tuple[str, str, str, str, str, bool]:
+    """
+    Returns: (title_html, pre_block, blockquote_content, tags_block, link_block, was_truncated)
+    quality_codec_suffix: optional string like " 📹1080P 📼AV1" appended after Video URL (included in overhead for truncation).
+    """
+    # Get messages instance
+    messages = safe_get_messages(user_id)
+    
+    title_html = f'<b>{title}</b>' if title else ''
+    # Pattern for finding timestamps at the beginning of a line (00:00, 0:00:00, 0.00, etc.)
+    timestamp_pattern = r'^\s*(\d{1,2}:\d{2}(?::\d{2})?|\d{1,2}\.\d{2}(?:\.\d{2})?)\s+.*'
+
+    lines = description.split('\n') if description else []
+    pre_block_lines = []
+    post_block_lines = []
+
+    # Split lines into timestamps and main text
+    for line in lines:
+        if re.match(timestamp_pattern, line):
+            pre_block_lines.append(line)
+        else:
+            post_block_lines.append(line)
+    
+    pre_block_str = '\n'.join(pre_block_lines)
+    post_block_str = '\n'.join(post_block_lines).strip()
+
+    tags_block = (tags_text.strip() + '\n') if tags_text and tags_text.strip() else ''
+    # --- Add bot name and optional quality/codec next to the link ---
+    bot_name = getattr(Config, 'BOT_NAME', None) or 'bot'
+    bot_mention = f' @{bot_name}' if not bot_name.startswith('@') else f' {bot_name}'
+    link_block = safe_get_messages(user_id).CAPTION_VIDEO_URL_LINK_MSG.format(
+        url=url, bot_mention=bot_mention, quality_codec=quality_codec_suffix
+    )
+    
+    was_truncated = False
+    
+    # Calculate constant overhead more accurately
+    overhead = len(tags_block) + len(link_block)
+    if title_html:
+        overhead += len(title_html) + 2 # for '\n\n'
+    if pre_block_str:
+        overhead += len(pre_block_str) + 1 # for '\n'
+    
+    # Calculate limit for blockquote (taking into account <blockquote> tags)
+    blockquote_overhead = len('<blockquote expandable></blockquote>') + 1 # for '\n'
+    blockquote_limit = max_length - overhead - blockquote_overhead
+    
+    # Ensure we have some space for content
+    if blockquote_limit and blockquote_limit <= 0:
+        # If no space for blockquote, truncate everything except essential parts
+        if title_html:
+            title_html = title_html[:max_length-10] + '...'
+        pre_block_str = ''
+        blockquote_content = ''
+        was_truncated = True
+    else:
+        blockquote_content = post_block_str
+        if len(blockquote_content) > blockquote_limit:
+            blockquote_content = blockquote_content[:blockquote_limit - 4] + '...'
+            was_truncated = True
+
+    # Final check and possible truncation of pre_block
+    current_length = overhead + len(blockquote_content) + blockquote_overhead
+    if current_length and current_length > max_length:
+        # Calculate how much space we can give to pre_block
+        pre_block_limit = max_length - (overhead - len(pre_block_str) - 1) - len(blockquote_content) - blockquote_overhead
+        if pre_block_limit and pre_block_limit > 0 and pre_block_limit < len(pre_block_str):
+            pre_block_str = pre_block_str[:pre_block_limit-4] + '...'
+            was_truncated = True
+        else: # if even with truncated pre_block it does not fit, truncate everything
+             pre_block_str = ''
+
+    if pre_block_str:
+        pre_block_str += '\n'
+
+    # Assembly caption
+    cap = ''
+    if title_html:
+        cap += title_html + '\n\n'
+    if pre_block_str:
+        cap += pre_block_str + '\n'
+    cap += f'<blockquote expandable>{blockquote_content}</blockquote>\n'
+    if tags_block:
+        cap += tags_block
+    cap += link_block
+    
+    # Final safety check - ensure we never exceed max_length
+    if len(cap) > max_length:
+        # Emergency truncation - keep only essential parts
+        essential_parts = []
+        if title_html:
+            essential_parts.append(title_html)
+        if tags_block:
+            essential_parts.append(tags_block.strip())
+        if link_block:
+            essential_parts.append(link_block)
+        
+        cap = '\n\n'.join(essential_parts)
+        if len(cap) > max_length:
+            # More aggressive truncation - remove HTML tags for calculation
+            plain_text = re.sub(r'<[^>]+>', '', cap)
+            if len(plain_text) > max_length:
+                # Truncate plain text and rebuild HTML
+                truncated_text = plain_text[:max_length-10] + '...'
+                cap = truncated_text
+            else:
+                cap = cap[:max_length-3] + '...'
+        was_truncated = True
+    
+    return title_html, pre_block_str, blockquote_content, tags_block, link_block, was_truncated

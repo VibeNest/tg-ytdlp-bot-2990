@@ -1,0 +1,3152 @@
+
+# ########################################
+# Down_and_audio function
+# ########################################
+
+import os
+from HELPERS.logger import get_log_channel
+from CONFIG.logger_msg import LoggerMsg
+import threading
+import time
+import traceback
+import json
+import yt_dlp
+from pyrogram.errors import FloodWait
+from HELPERS.app_instance import get_app
+from HELPERS.logger import logger, send_to_logger, send_to_user, send_to_all, send_error_to_user, log_error_to_channel
+from HELPERS.limitter import TimeFormatter, humanbytes, check_user
+from HELPERS.download_status import set_active_download, clear_download_start_time, check_download_timeout, start_hourglass_animation, start_cycle_progress, progress_bar, playlist_errors, playlist_errors_lock, register_download_cancel_event, unregister_download_cancel_event
+from HELPERS.safe_messeger import safe_delete_messages, safe_edit_message_text, safe_forward_messages
+from HELPERS.filesystem_hlp import sanitize_filename, sanitize_filename_strict, create_directory, check_disk_space, cleanup_user_temp_files
+from DATABASE.firebase_init import write_logs
+from URL_PARSERS.tags import generate_final_tags
+from services.stats_events import update_download_progress
+from URL_PARSERS.nocookie import is_no_cookie_domain
+from URL_PARSERS.filter_check import is_no_filter_domain
+from URL_PARSERS.filter_utils import create_smart_match_filter, create_legacy_match_filter
+from URL_PARSERS.youtube import is_youtube_url, download_thumbnail
+from URL_PARSERS.thumbnail_downloader import download_thumbnail as download_universal_thumbnail
+from HELPERS.pot_helper import add_pot_to_ytdl_opts, is_age_restriction_error
+from CONFIG.limits import LimitsConfig
+from HELPERS.fallback_helper import should_fallback_to_gallery_dl
+from HELPERS.upload_guard import timed_upload, UploadAlreadyInProgressError
+import subprocess
+from urllib.parse import urlparse
+from PIL import Image
+import io
+from CONFIG.config import Config
+from CONFIG.messages import Messages, safe_get_messages
+from COMMANDS.subtitles_cmd import is_subs_enabled, check_subs_availability, get_user_subs_auto_mode, _subs_check_cache, download_subtitles_ytdlp, is_subs_always_ask
+from COMMANDS.mediainfo_cmd import send_mediainfo_if_enabled
+from URL_PARSERS.playlist_utils import is_playlist_with_range, is_playlist_url, is_playlist_from_info_dict
+from URL_PARSERS.normalizer import get_clean_playlist_url
+from DATABASE.cache_db import get_cached_playlist_videos, get_cached_message_ids, save_to_video_cache, save_to_playlist_cache
+from pyrogram.types import ReplyParameters
+from HELPERS.safe_messeger import safe_send_message
+from pyrogram import enums
+from URL_PARSERS.tags import extract_url_range_tags
+
+# Get app instance for decorators
+app = get_app()
+
+# Dictionary to track active uploads for logging
+_active_audio_uploads = {}
+_active_audio_uploads_lock = threading.Lock()
+
+# Sentinel for "thread-local cookie override is not set" (distinguishes
+# "override = None" from "no override at all"). Used by issue #383 fix.
+_NOT_SET = object()
+
+def _start_upload_logging(user_id, msg_id):
+    """Start logging upload activity to prevent watchdog false positives"""
+    stop_event = threading.Event()
+    key = (user_id, msg_id)
+    
+    with _active_audio_uploads_lock:
+        _active_audio_uploads[key] = stop_event
+    
+    def upload_logger():
+        while not stop_event.is_set():
+            logger.info("[Upload] Uploading audio to Telegram")
+            # Wait 10 seconds or until stop event
+            stop_event.wait(10.0)
+    
+    thread = threading.Thread(target=upload_logger, daemon=True)
+    thread.start()
+    return stop_event
+
+def _stop_upload_logging(user_id, msg_id):
+    """Stop logging upload activity"""
+    key = (user_id, msg_id)
+    with _active_audio_uploads_lock:
+        if key in _active_audio_uploads:
+            stop_event = _active_audio_uploads[key]
+            stop_event.set()
+            del _active_audio_uploads[key]
+
+
+def is_skippable_video_error(error_message: str) -> bool:
+    """
+    Определяет, является ли ошибка пропускаемой (частной ошибкой конкретного видео).
+    Такие ошибки не должны останавливать скачивание всего плейлиста.
+    
+    Args:
+        error_message: Текст ошибки от yt-dlp
+        
+    Returns:
+        True если ошибку можно пропустить и продолжить со следующим видео, False иначе
+    """
+    if not error_message:
+        return False
+    
+    error_lower = error_message.lower()
+    
+    # Пропускаемые ошибки - частные проблемы конкретного видео
+    skippable_patterns = [
+        # VK ошибки
+        "removed at the request of the copyright holder",
+        "removed at the request",
+        # YouTube ошибки
+        "removed for violating youtube's policy",
+        "removed for violating",
+        "video unavailable. this video is not available",
+        "video unavailable",
+        "this video has been removed",
+        "video is not available",
+        "premieres in",
+        "premieres on",
+        # Общие паттерны
+        "copyright holder",
+        "violating.*policy",
+        "video.*removed",
+        "video.*unavailable",
+    ]
+    
+    for pattern in skippable_patterns:
+        import re
+        if re.search(pattern, error_lower, re.IGNORECASE):
+            return True
+    
+    return False
+
+
+def create_telegram_thumbnail(cover_path, output_path, size=320):
+    """Create a Telegram-compliant thumbnail from cover image using center crop (no black bars)."""
+    try:
+        logger.info(f"Creating Telegram thumbnail: {cover_path} -> {output_path}")
+        
+        # Open image with PIL
+        with Image.open(cover_path) as img:
+            # Convert to RGB (handles CMYK and other color spaces)
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Center-crop to a square (no padding) 
+            width, height = img.size
+            side = min(width, height)
+            left = (width - side) // 2
+            top = (height - side) // 2
+            right = left + side
+            bottom = top + side
+            img_cropped = img.crop((left, top, right, bottom))
+            
+            # Resize to required size
+            img_resized = img_cropped.resize((size, size), Image.Resampling.LANCZOS)
+            
+            # Save as JPEG with baseline encoding and quality 0.8
+            img_resized.save(output_path, 'JPEG', quality=95, optimize=True, progressive=False)
+            
+            # Check file size and reduce quality if needed (<200KB)
+            file_size = os.path.getsize(output_path)
+            logger.info(f"Telegram thumbnail created: {output_path}, size: {file_size} bytes")
+            
+            if file_size and file_size > 200 * 1024:  # 200KB
+                logger.warning(f"Thumbnail size ({file_size} bytes) exceeds 200KB limit, reducing quality")
+                img_resized.save(output_path, 'JPEG', quality=60, optimize=True, progressive=False)
+                new_size = os.path.getsize(output_path)
+                logger.info(f"Reduced quality thumbnail size: {new_size} bytes")
+            
+            return True
+            
+    except Exception as e:
+        logger.error(f"Error creating Telegram thumbnail: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return False
+
+def embed_cover_audio(audio_path, cover_path, title=None, artist=None, album=None):
+    """Embed cover art into any audio file via ffmpeg.
+    Supports: MP3 (ID3v2 APIC), M4A/AAC/ALAC (MP4 covr), FLAC, OPUS, OGG/Vorbis.
+    WAV and AC3 do not support cover art — skipped gracefully."""
+    try:
+        ext = os.path.splitext(audio_path)[1].lower()
+
+        if ext in ('.wav', '.ac3'):
+            logger.info(f"Cover art not supported for {ext} format, skipping: {audio_path}")
+            return True
+
+        # OGG/OPUS/FLAC cover art is embedded by yt-dlp's EmbedThumbnail
+        # postprocessor (mutagen-based). ffmpeg cannot embed covers in
+        # OGG containers — skip to avoid corrupting the file.
+        if ext in ('.opus', '.ogg'):
+            logger.info(f"Cover art for {ext} handled by EmbedThumbnail (mutagen), skipping ffmpeg: {audio_path}")
+            return True
+
+        logger.info(f"Starting cover embedding: {audio_path} ({ext}), Cover={cover_path}")
+
+        if not os.path.exists(audio_path):
+            logger.error(f"Audio file not found: {audio_path}")
+            return False
+        if not os.path.exists(cover_path):
+            logger.error(f"Cover file not found: {cover_path}")
+            return False
+
+        if cover_path.lower().endswith(('.webp', '.png')):
+            jpeg_path = cover_path.rsplit('.', 1)[0] + '.jpg'
+            logger.info(f"Converting cover to JPEG: {cover_path} -> {jpeg_path}")
+            result = subprocess.run([
+                "ffmpeg", "-y", "-i", cover_path, jpeg_path
+            ], check=True, capture_output=True, timeout=120)
+            if result.stderr:
+                logger.debug(f"FFmpeg cover conversion stderr: {result.stderr.decode('utf-8', errors='replace')}")
+            cover_path = jpeg_path
+
+        base, ext_with_dot = os.path.splitext(audio_path)
+        out_path = base + '_tagged' + ext_with_dot
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", audio_path,
+            "-i", cover_path,
+            "-map", "0:a:0", "-map", "1:v:0",
+            "-c:a", "copy",
+            "-c:v", "mjpeg",
+            "-disposition:v", "attached_pic"
+        ]
+
+        if ext == '.mp3':
+            cmd.extend([
+                "-id3v2_version", "3",
+                "-metadata:s:v", "title=Album cover",
+                "-metadata:s:v", "comment=Cover (front)",
+            ])
+
+        if title:
+            cmd.extend(["-metadata", f"title={title}"])
+        if artist:
+            cmd.extend(["-metadata", f"artist={artist}"])
+        if album:
+            cmd.extend(["-metadata", f"album={album}"])
+
+        cmd.append(out_path)
+
+        logger.info(f"Running ffmpeg command: {' '.join(cmd)}")
+
+        result = subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+
+        if result.stdout:
+            logger.info(f"FFmpeg stdout: {result.stdout.decode('utf-8', errors='replace')}")
+        if result.stderr:
+            logger.info(f"FFmpeg stderr: {result.stderr.decode('utf-8', errors='replace')}")
+
+        if os.path.exists(out_path):
+            os.replace(out_path, audio_path)
+            logger.info(f"Successfully embedded cover in {audio_path}")
+            return True
+        else:
+            logger.error(f"Failed to create tagged file: {out_path}")
+            return False
+
+    except subprocess.CalledProcessError as e:
+        stderr_text = e.stderr.decode('utf-8', errors='replace') if isinstance(e.stderr, bytes) else str(e.stderr)
+        logger.error(f"FFmpeg error embedding cover: {stderr_text}")
+        logger.error(f"FFmpeg command that failed: {' '.join(cmd) if 'cmd' in locals() else 'Unknown'}")
+        return False
+    except Exception as e:
+        logger.error(f"Error embedding cover: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return False
+
+_AUDIO_CODEC_DISPLAY = {
+    'mp3': 'MP3', 'mp3float': 'MP3',
+    'aac': 'AAC', 'aac_latm': 'AAC',
+    'opus': 'OPUS',
+    'vorbis': 'VORBIS',
+    'flac': 'FLAC',
+    'alac': 'ALAC',
+    'ac3': 'AC3',
+    'pcm_s16le': 'PCM', 'pcm_s24le': 'PCM', 'pcm_f32le': 'PCM',
+    'pcm_s32le': 'PCM', 'pcm_u8': 'PCM',
+}
+
+
+def get_audio_bitrate_codec(audio_path):
+    """Get audio codec name and bit rate (bps as string) from file via ffprobe.
+    Returns (codec_name, bit_rate_bps) or (None, None) on failure."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=codec_name,bit_rate",
+            "-show_entries", "format=bit_rate",
+            "-of", "json",
+            audio_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        if result.returncode != 0:
+            logger.debug(f"ffprobe failed for {audio_path}")
+            return None, None
+
+        data = json.loads(result.stdout.decode('utf-8', errors='replace'))
+        streams = data.get('streams', [])
+        codec_name = None
+        bit_rate = None
+        if streams:
+            codec_name = streams[0].get('codec_name')
+            bit_rate = streams[0].get('bit_rate')
+        if not bit_rate or bit_rate == 'N/A':
+            bit_rate = data.get('format', {}).get('bit_rate')
+
+        return codec_name, bit_rate
+    except Exception as e:
+        logger.debug(f"Error probing audio for bitrate/codec: {e}")
+        return None, None
+
+
+def format_audio_quality_suffix(codec_name=None, bit_rate=None):
+    """Build audio quality suffix for caption: ' 💿192 kb/s 📻OPUS'."""
+    parts = []
+    if bit_rate:
+        try:
+            kbps = int(bit_rate) // 1000
+            if kbps > 0:
+                parts.append(f"💿{kbps} kb/s")
+        except (ValueError, TypeError):
+            pass
+    if codec_name:
+        display = _AUDIO_CODEC_DISPLAY.get(codec_name.lower(), codec_name.upper())
+        parts.append(f"📻{display}")
+    return (" " + " ".join(parts)) if parts else ""
+def down_and_audio(app, message, url, tags, quality_key=None, playlist_name=None, video_count=1, video_start_with=1, format_override=None, cookies_already_checked=False, use_proxy=False, cached_video_info=None, download_sections=None):
+    # Сбрасываем кеш проверенных источников куки для новой задачи загрузки
+    user_id = message.chat.id
+    from COMMANDS.cookies_cmd import reset_checked_cookie_sources
+    reset_checked_cookie_sources(user_id)
+    logger.info(f"🔄 [DEBUG] Reset checked cookie sources for new audio download task for user {user_id}")
+    messages = safe_get_messages(message.chat.id)
+    
+    # Load trim sections if not provided
+    if download_sections is None:
+        from DOWN_AND_UP.always_ask_menu import load_trim_sections
+        download_sections = load_trim_sections(user_id, url)
+        if download_sections:
+            logger.info(f"Loaded trim sections for audio download: user {user_id}, URL: {url}, sections: {download_sections}")
+    
+    """
+    Now if part of the playlist range is already cached, we first repost the cached indexes, then download and cache the missing ones, without finishing after reposting part of the range.
+    """
+    # Import required modules at the beginning
+    from COMMANDS.cookies_cmd import is_youtube_cookie_error, is_youtube_geo_error, retry_download_with_different_cookies, retry_download_with_proxy
+    
+    playlist_indices = []
+    playlist_msg_ids = []  
+        
+    user_id = message.chat.id
+    logger.info(f"down_and_audio called: url={url}, quality_key={quality_key}, video_count={video_count}, video_start_with={video_start_with}")
+    
+    # ЖЕСТКО: Сохраняем оригинальный текст с диапазоном для фоллбэка
+    original_message_text = message.text or message.caption or ""
+    logger.info(f"[ORIGINAL TEXT] Saved for fallback: {original_message_text}")
+    
+    # Initialize retry guards early to avoid UnboundLocalError
+    did_proxy_retry = False
+    did_cookie_retry = False
+    did_live_from_start_retry = False
+    did_format_fallback = False
+    _audio_format_fallback = None  # Set by format fallback when 'ba' is unavailable
+    is_hls = False
+    unknown_error_message_sent = False  # Флаг для предотвращения спама сообщений об ошибках
+    down_and_audio._error_message_sent = False  # Флаг для предотвращения спама yt-dlp ошибок
+    
+    # Determine forced NSFW via user tags
+    try:
+        _u, _s, _e, _p, _tags, _tags_text, _err = extract_url_range_tags(original_message_text)
+        user_forced_nsfw = any(t.lower() in ("#nsfw", "#porn") for t in (_tags or []))
+    except Exception:
+        user_forced_nsfw = False
+    
+    # Check if LINK mode is enabled - if yes, get direct link instead of downloading
+    try:
+        from DOWN_AND_UP.always_ask_menu import get_link_mode
+        if get_link_mode(user_id):
+            logger.info(f"LINK mode enabled for user {user_id}, getting direct link instead of downloading audio")
+            
+            # Import link function
+            from COMMANDS.link_cmd import get_direct_link
+            
+            # Convert quality key to quality argument
+            quality_arg = None
+            if quality_key and quality_key != "best" and quality_key != "mp3":
+                quality_arg = quality_key
+            
+            # Get direct link
+            result = get_direct_link(url, user_id, quality_arg, cookies_already_checked=cookies_already_checked, use_proxy=True)
+            
+            if result.get('success'):
+                title = result.get('title', 'Unknown')
+                duration = result.get('duration', 0)
+                video_url = result.get('video_url')
+                audio_url = result.get('audio_url')
+                format_spec = result.get('format', 'best')
+                
+                # Form response
+                response = safe_get_messages(user_id).DIRECT_LINK_OBTAINED_MSG
+                response += safe_get_messages(user_id).TITLE_FIELD_MSG.format(title=title)
+                if duration and duration > 0:
+                    response += safe_get_messages(user_id).DURATION_FIELD_MSG.format(duration=duration)
+                response += safe_get_messages(user_id).FORMAT_FIELD_MSG.format(format_spec=format_spec)
+                
+                if video_url:
+                    response += safe_get_messages(user_id).VIDEO_STREAM_FIELD_MSG.format(video_url=video_url)
+                
+                if audio_url:
+                    response += safe_get_messages(user_id).AUDIO_STREAM_FIELD_MSG.format(audio_url=audio_url)
+                
+                if not video_url and not audio_url:
+                    response += safe_get_messages(user_id).DOWN_UP_FAILED_STREAM_LINKS_MSG
+                
+                # Send response
+                app.send_message(
+                    user_id, 
+                    response, 
+                    reply_parameters=ReplyParameters(message_id=message.id),
+                    parse_mode=enums.ParseMode.HTML
+                )
+                
+                send_to_logger(message, safe_get_messages(user_id).DIRECT_LINK_EXTRACTED_DOWN_AUDIO_LOG_MSG.format(user_id=user_id, url=url))
+                
+            else:
+                error_msg = result.get('error', 'Unknown error')
+                app.send_message(
+                    user_id,
+                    safe_get_messages(user_id).DOWN_UP_ERROR_GETTING_LINK_MSG.format(error_msg=error_msg),
+                    reply_parameters=ReplyParameters(message_id=message.id),
+                    parse_mode=enums.ParseMode.HTML
+                )
+                
+                log_error_to_channel(message, safe_get_messages(user_id).DIRECT_LINK_FAILED_DOWN_AUDIO_LOG_MSG.format(user_id=user_id, url=url, error=error_msg), url)
+            
+            return
+    except Exception as e:
+        logger.error(f"Error checking LINK mode for user {user_id}: {e}")
+        # Continue with normal download if LINK mode check fails
+    
+    # We define a playlist not only by the number of videos, but also by the presence of a range in the URL
+    original_text = message.text or message.caption or ""
+    is_playlist = video_count > 1 or is_playlist_with_range(original_text)
+    
+    # Получаем video_end_with из original_text, если он там есть
+    from URL_PARSERS.tags import extract_url_range_tags
+    _, parsed_start, parsed_end, _, _, _, _ = extract_url_range_tags(original_text)
+    video_end_with = parsed_end if parsed_end != 1 or parsed_start != 1 else (video_start_with + video_count - 1)
+    
+    # Check if auto-range was added (for playlist hint message)
+    # Check if message has the flag or if URL is playlist and range was auto-added
+    auto_range_added = False
+    if hasattr(message, '_auto_range_added') and message._auto_range_added:
+        auto_range_added = True
+    else:
+        # Try to determine if it's a playlist using multiple methods
+        is_playlist_detected = False
+        
+        # Method 1: Check URL pattern (fast, no API call)
+        if is_playlist_url(url):
+            is_playlist_detected = True
+        
+        # Method 2: Check cached_video_info if available (fast, uses cached data)
+        if not is_playlist_detected and cached_video_info:
+            if is_playlist_from_info_dict(cached_video_info):
+                is_playlist_detected = True
+                logger.info(f"🔍 [DEBUG] Playlist detected from cached_video_info for URL: {url}")
+        
+        # If playlist detected, check if range was auto-added
+        if is_playlist_detected:
+            from URL_PARSERS.video_extractor import has_range_syntax
+            if not has_range_syntax(original_text) and video_start_with == 1 and video_end_with == 1 and video_count == 1:
+                auto_range_added = True
+                logger.info(f"🔍 [DEBUG] Auto-range added detected for playlist URL: {url}")
+    
+    # Определяем, нужен ли обратный порядок (когда start > end)
+    # Для отрицательных индексов: -1 до -7 означает обратный порядок (7, 6, 5, 4, 3, 2, 1)
+    is_reverse_order = False
+    has_negative_indices = False
+    if is_playlist and video_start_with is not None and video_end_with is not None:
+        # Если оба отрицательные, всегда используем обратный порядок
+        if video_start_with < 0 and video_end_with < 0:
+            is_reverse_order = True
+            has_negative_indices = True
+        # Если start > end, это обратный порядок
+        elif video_start_with > video_end_with:
+            is_reverse_order = True
+    
+    # Формируем список индексов с учетом обратного порядка
+    # Для отрицательных индексов нужно будет преобразовать их в положительные после получения общего количества видео
+    if is_playlist:
+        if has_negative_indices:
+            # Для отрицательных индексов сначала создаем список с отрицательными значениями
+            # Позже преобразуем их в положительные после получения общего количества видео
+            # -1 до -7 означает: качать в порядке 7, 6, 5, 4, 3, 2, 1 (от последнего к первому)
+            if abs(video_start_with) < abs(video_end_with):
+                # -1 до -7: создаем список [-1, -2, -3, -4, -5, -6, -7]
+                requested_indices = list(range(video_start_with, video_end_with - 1, -1))
+            else:
+                # -7 до -1: создаем список [-7, -6, -5, -4, -3, -2, -1]
+                requested_indices = list(range(video_start_with, video_end_with + 1, 1))
+        elif is_reverse_order:
+            # Для обратного порядка: от start до end включительно в обратном порядке
+            requested_indices = list(range(video_start_with, video_end_with - 1, -1))
+        else:
+            # Для прямого порядка: от start до end включительно
+            requested_indices = list(range(video_start_with, video_start_with + video_count))
+    else:
+        requested_indices = []
+    playlist_indices_all = requested_indices[:] if requested_indices else []
+    use_range_download = is_playlist and any(idx < 0 for idx in requested_indices)
+    cached_videos = {}
+    uncached_indices = []
+    if quality_key and is_playlist:
+        # Check active functions (TRIM, SUBS, DUBS) - disable cache if any are active
+        from DOWN_AND_UP.always_ask_menu import get_active_functions
+        active_funcs = get_active_functions(user_id, url)
+        should_disable_cache = active_funcs["should_disable_cache"]
+        
+        if should_disable_cache:
+            logger.info(f"[AUDIO CACHE] Active functions detected for user {user_id}, URL: {url}, disabling cache. TRIM: {active_funcs['has_trim']}, SUBS: {active_funcs['has_subs']}, DUBS: {active_funcs['has_dubs']}")
+            cached_videos = {}
+            uncached_indices = requested_indices
+        # Check if Always Ask mode is enabled - if yes, skip cache completely
+        elif not is_subs_always_ask(user_id):
+            # Check if content is NSFW - if so, skip cache lookup
+            from HELPERS.porn import is_porn
+            is_nsfw = is_porn(url, "", "", None) or user_forced_nsfw
+            logger.info(f"[FALLBACK] is_porn check for {url}: {is_porn(url, '', '', None)}, user_forced_nsfw: {user_forced_nsfw}, final is_nsfw: {is_nsfw}")
+            if not is_nsfw:
+                cached_videos = get_cached_playlist_videos(get_clean_playlist_url(url), quality_key, requested_indices)
+                uncached_indices = [i for i in requested_indices if i not in cached_videos]
+            else:
+                logger.info(f"down_and_audio: skipping cache lookup for NSFW playlist content (url={url})")
+                cached_videos = {}
+                uncached_indices = requested_indices
+        else:
+            logger.info(f"[AUDIO CACHE] Skipping cache check for playlist because Always Ask mode is enabled: url={url}, quality={quality_key}")
+            cached_videos = {}
+            uncached_indices = requested_indices
+        # First, repost the cached ones (skip if send_as_file is enabled)
+        if cached_videos and (not use_range_download or len(uncached_indices) == 0):
+            # Check if send_as_file is enabled - if so, skip cache repost
+            from COMMANDS.args_cmd import get_user_args
+            user_args = get_user_args(user_id)
+            send_as_file = user_args.get("send_as_file", False)
+            
+            if not send_as_file:
+                for index in requested_indices:
+                    if index in cached_videos:
+                        try:
+                            # Determine the correct log channel based on content type
+                            from HELPERS.porn import is_porn
+                            is_nsfw = is_porn(url, "", "", None) or user_forced_nsfw
+                            logger.info(f"[FALLBACK] is_porn check for {url}: {is_porn(url, '', '', None)}, user_forced_nsfw: {user_forced_nsfw}, final is_nsfw: {is_nsfw}")
+                            is_private_chat = getattr(message.chat, "type", None) == enums.ChatType.PRIVATE
+                            is_paid = is_nsfw and is_private_chat
+                            
+                            # Get the correct log channel for reposting
+                            if is_paid:
+                                from_chat_id = get_log_channel("video", paid=True)
+                            elif is_nsfw:
+                                from_chat_id = get_log_channel("video", nsfw=True)
+                            else:
+                                from_chat_id = get_log_channel("video")
+                            
+                            # Verify we're reposting from a valid log channel
+                            valid_channels = [
+                                get_log_channel("video"),
+                                get_log_channel("video", nsfw=True),
+                                get_log_channel("video", paid=True)
+                            ]
+                            if from_chat_id not in valid_channels:
+                                logger.error(f"CRITICAL: Attempting to repost from wrong channel {from_chat_id}")
+                                continue
+                            
+                            logger.info(f"[AUDIO CACHE] Reposting audio {index} from channel {from_chat_id} to user {user_id}, message_id={cached_videos[index]}")
+                            forward_kwargs = {
+                                'chat_id': user_id,
+                                'from_chat_id': from_chat_id,
+                                'message_ids': [cached_videos[index]]
+                            }
+                            # Only apply thread_id in groups/channels, not in private chats
+                            if getattr(message.chat, "type", None) != enums.ChatType.PRIVATE:
+                                thread_id = getattr(message, 'message_thread_id', None)
+                                if thread_id:
+                                    forward_kwargs['message_thread_id'] = thread_id
+                            app.forward_messages(**forward_kwargs)
+                        except Exception as e:
+                            logger.error(f"down_and_audio: error reposting cached audio index={index}: {e}")
+            else:
+                # If send_as_file is enabled, treat all indices as uncached
+                logger.info(f"[AUDIO CACHE] send_as_file enabled for user {user_id}, skipping cache repost for playlist")
+                uncached_indices = requested_indices
+            if len(uncached_indices) == 0:
+                app.send_message(user_id, safe_get_messages(user_id).PLAYLIST_CACHE_SENT_MSG.format(cached=len(cached_videos), total=len(requested_indices)), reply_parameters=ReplyParameters(message_id=message.id))
+                send_to_logger(message, LoggerMsg.PLAYLIST_AUDIO_SENT_FROM_CACHE.format(quality=quality_key, user_id=user_id))
+                return
+            else:
+                app.send_message(user_id, safe_get_messages(user_id).CACHE_PARTIAL_MSG.format(cached=len(cached_videos), total=len(requested_indices)), reply_parameters=ReplyParameters(message_id=message.id))
+        elif cached_videos:
+            logger.info("[AUDIO CACHE] Skipping partial cache replay for negative range to avoid duplicate downloads")
+            uncached_indices = requested_indices
+    elif quality_key and not is_playlist:
+        # Check active functions (TRIM, SUBS, DUBS) - disable cache if any are active
+        from DOWN_AND_UP.always_ask_menu import get_active_functions
+        active_funcs = get_active_functions(user_id, url)
+        should_disable_cache = active_funcs["should_disable_cache"]
+        
+        if should_disable_cache:
+            logger.info(f"[AUDIO CACHE] Active functions detected for user {user_id}, URL: {url}, disabling cache. TRIM: {active_funcs['has_trim']}, SUBS: {active_funcs['has_subs']}, DUBS: {active_funcs['has_dubs']}")
+            cached_ids = None
+        # Check if Always Ask mode is enabled - if yes, skip cache completely
+        elif not is_subs_always_ask(user_id):
+            # Check if content is NSFW - if so, skip cache lookup
+            from HELPERS.porn import is_porn
+            is_nsfw = is_porn(url, "", "", None) or user_forced_nsfw
+            logger.info(f"[FALLBACK] is_porn check for {url}: {is_porn(url, '', '', None)}, user_forced_nsfw: {user_forced_nsfw}, final is_nsfw: {is_nsfw}")
+            if not is_nsfw:
+                cached_ids = get_cached_message_ids(url, quality_key)
+            else:
+                logger.info(f"down_and_audio: skipping cache lookup for NSFW single audio content (url={url})")
+                cached_ids = None
+        else:
+            logger.info(f"[AUDIO CACHE] Skipping cache check because Always Ask mode is enabled: url={url}, quality={quality_key}")
+            cached_ids = None
+        
+        if cached_ids:
+            # Check if send_as_file is enabled - if so, skip cache repost
+            from COMMANDS.args_cmd import get_user_args
+            user_args = get_user_args(user_id)
+            send_as_file = user_args.get("send_as_file", False)
+            
+            if not send_as_file:
+                try:
+                    # Determine the correct log channel based on content type
+                    # is_nsfw already determined above
+                    is_private_chat = getattr(message.chat, "type", None) == enums.ChatType.PRIVATE
+                    is_paid = is_nsfw and is_private_chat
+                    
+                    # Get the correct log channel for reposting
+                    if is_paid:
+                        from_chat_id = get_log_channel("video", paid=True)
+                    elif is_nsfw:
+                        from_chat_id = get_log_channel("video", nsfw=True)
+                    else:
+                        from_chat_id = get_log_channel("video")
+                    
+                    # Verify we're reposting from a valid log channel
+                    valid_channels = [
+                        get_log_channel("video"),
+                        get_log_channel("video", nsfw=True),
+                        get_log_channel("video", paid=True)
+                    ]
+                    if from_chat_id not in valid_channels:
+                        logger.error(f"CRITICAL: Attempting to repost from wrong channel {from_chat_id}")
+                        raise Exception("Wrong channel for repost")
+                    
+                    logger.info(f"[AUDIO CACHE] Reposting audio from channel {from_chat_id} to user {user_id}, message_ids={cached_ids}")
+                    forward_kwargs = {
+                        'chat_id': user_id,
+                        'from_chat_id': from_chat_id,
+                        'message_ids': cached_ids
+                    }
+                    # Only apply thread_id in groups/channels, not in private chats
+                    if getattr(message.chat, "type", None) != enums.ChatType.PRIVATE:
+                        thread_id = getattr(message, 'message_thread_id', None)
+                        if thread_id:
+                            forward_kwargs['message_thread_id'] = thread_id
+                    app.forward_messages(**forward_kwargs)
+                    app.send_message(user_id, safe_get_messages(user_id).AUDIO_SENT_FROM_CACHE_MSG, reply_parameters=ReplyParameters(message_id=message.id))
+                    send_to_logger(message, LoggerMsg.AUDIO_SENT_FROM_CACHE.format(quality=quality_key, user_id=user_id))
+                    return
+                except Exception as e:
+                    logger.error(f"Error reposting audio from cache: {e}")
+                    save_to_video_cache(url, quality_key, [], clear=True)
+                    # Don't show error message if we successfully got audio from cache
+                    # The audio was already sent successfully in the try block
+            else:
+                # If send_as_file is enabled, skip cache repost and continue with download
+                logger.info(f"[AUDIO CACHE] send_as_file enabled for user {user_id}, skipping cache repost for single audio")
+    else:
+        logger.info(f"down_and_audio: quality_key is None, skipping cache check")
+
+    anim_thread = None
+    stop_anim = threading.Event()
+    proc_msg = None
+    proc_msg_id = None
+    status_msg = None
+    status_msg_id = None
+    hourglass_msg = None
+    hourglass_msg_id = None
+    download_started_msg_id = None
+    audio_files = []
+    # Per-user cancel event: /clean sets this to abort the download
+    _cancel_ev = register_download_cancel_event(user_id)
+    try:
+        # Check if there is a saved waiting time
+        from HELPERS.safe_messeger import read_flood_wait_remaining, _write_flood_wait_file
+        flood_remaining, flood_time_str = read_flood_wait_remaining(user_id)
+
+        # We send the initial message
+        if flood_remaining is not None:
+            proc_msg = safe_send_message(user_id, safe_get_messages(user_id).RATE_LIMIT_WITH_TIME_MSG.format(time=flood_time_str), message=message)
+        else:
+            proc_msg = safe_send_message(user_id, safe_get_messages(user_id).RATE_LIMIT_NO_TIME_MSG, message=message)
+
+        # We are trying to replace with "Download started"
+        try:
+            app.edit_message_text(
+                chat_id=user_id,
+                message_id=proc_msg.id,
+                text=safe_get_messages(user_id).DOWNLOAD_STARTED_MSG,
+                parse_mode=enums.ParseMode.HTML
+            )
+            # Schedule deletion of "Download started" message after 5 seconds
+            try:
+                from HELPERS.safe_messeger import schedule_delete_message
+                schedule_delete_message(user_id, proc_msg.id, delete_after_seconds=5)
+            except Exception as e:
+                logger.error(f"Error scheduling download started message deletion: {e}")
+        except FloodWait as e:
+            _write_flood_wait_file(user_id, e.value)
+            return
+        except Exception as e:
+            logger.error(f"Error editing message: {e}")
+            # Stop animation before returning
+            stop_anim.set()
+            if anim_thread:
+                anim_thread.join(timeout=1)
+            return
+
+        # If there is no flood error, send a normal message (only once)
+        proc_msg = app.send_message(user_id, safe_get_messages(user_id).PROCESSING_MSG, reply_parameters=ReplyParameters(message_id=message.id))
+        # Pin proc/status message for visibility
+        try:
+            app.pin_chat_message(user_id, proc_msg.id, disable_notification=True)
+        except Exception:
+            pass
+        proc_msg_id = proc_msg.id
+        status_msg = safe_send_message(user_id, safe_get_messages(user_id).AUDIO_PROCESSING_MSG, message=message)
+        hourglass_msg = safe_send_message(user_id, safe_get_messages(user_id).WAITING_HOURGLASS_MSG, message=message)
+        try:
+            from HELPERS.safe_messeger import schedule_delete_message
+            if status_msg and hasattr(status_msg, 'id'):
+                schedule_delete_message(user_id, status_msg.id, delete_after_seconds=5)
+            # track to force-delete on error
+            download_started_msg_id = proc_msg.id
+        except Exception:
+            pass
+        status_msg_id = status_msg.id
+        hourglass_msg_id = hourglass_msg.id
+        anim_thread = start_hourglass_animation(user_id, hourglass_msg_id, stop_anim)
+
+        # Check if there's enough disk space (estimate 500MB per audio file)
+        user_folder = os.path.abspath(os.path.join("users", str(user_id)))
+        create_directory(user_folder)
+
+        if not check_disk_space(user_folder, 280 * 1024 * 1024 * video_count):
+            send_to_user(message, safe_get_messages(user_id).ERROR_NO_DISK_SPACE_MSG)
+            return
+
+        # Create user directory (subscription already checked in video_extractor)
+        user_dir = os.path.join("users", str(user_id))
+        if not os.path.exists(user_dir):
+            os.makedirs(user_dir, exist_ok=True)
+
+        # Try to get download directory from ask_quality_menu first
+        from DOWN_AND_UP.always_ask_menu import get_user_download_dir, generate_download_dir_name
+        user_folder = get_user_download_dir(user_id)
+        
+        # If no download directory from ask_quality_menu, create one
+        if not user_folder or not os.path.exists(user_folder):
+            try:
+                # Generate download directory name based on URL
+                dir_name = generate_download_dir_name(url)
+                unique_download_dir = os.path.join(user_dir, "downloads", dir_name)
+                os.makedirs(unique_download_dir, exist_ok=True)
+                
+                # Update user_folder to use the unique directory
+                user_folder = unique_download_dir
+                
+                logger.info(f"Created download directory: {unique_download_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to create download directory, using default: {e}")
+                # Fallback to original behavior
+                user_folder = os.path.abspath(os.path.join("users", str(user_id)))
+
+
+        # Pre-cleanup: remove all media files from unique download directory before starting
+        try:
+            logger.info(f"Pre-cleanup: removing old media files from unique directory {user_folder}")
+            if os.path.exists(user_folder):
+                for root, dirs, files in os.walk(user_folder):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        try:
+                            # Remove all media files (keep .txt and .json files)
+                            if file.lower().endswith((
+                                '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff',
+                                '.mp4', '.m4v', '.avi', '.mov', '.mkv', '.webm', '.flv',
+                                '.mp3', '.wav', '.ogg', '.m4a',
+                                '.pdf', '.doc', '.docx', '.zip', '.rar', '.7z'
+                            )):
+                                os.remove(file_path)
+                                logger.info(f"Pre-cleanup: removed file {file_path}")
+                        except Exception as e:
+                            logger.warning(f"Pre-cleanup: failed to remove file {file_path}: {e}")
+                    
+                    # Remove empty directories (except unique download root)
+                    for dir_name in dirs:
+                        dir_path = os.path.join(root, dir_name)
+                        try:
+                            if os.path.exists(dir_path) and not os.listdir(dir_path) and dir_path != user_folder:
+                                os.rmdir(dir_path)
+                                logger.info(f"Pre-cleanup: removed empty directory {dir_path}")
+                        except Exception as e:
+                            logger.warning(f"Pre-cleanup: failed to remove directory {dir_path}: {e}")
+            
+            # Create protection file for parallel downloads
+            from HELPERS.filesystem_hlp import is_parallel_download_allowed, create_protection_file
+            if is_parallel_download_allowed(message):
+                create_protection_file(user_folder)
+            
+            logger.info(f"Pre-cleanup completed for unique directory {user_folder}")
+        except Exception as e:
+            logger.warning(f"Pre-cleanup failed for unique directory {user_folder}: {e}")
+
+        # Reset of the flag of errors for the new launch of the playlist
+        if playlist_name:
+            with playlist_errors_lock:
+                error_key = f"{user_id}_{playlist_name}"
+                if error_key in playlist_errors:
+                    del playlist_errors[error_key]
+
+        # Check if cookie.txt exists in the user's folder
+        user_cookie_path = os.path.join(user_folder, "cookie.txt")
+        
+        # For YouTube URLs, use optimized cookie logic - check existing first on user's URL, then retry if needed
+        if is_youtube_url(url):
+            from COMMANDS.cookies_cmd import get_youtube_cookie_urls, test_youtube_cookies_on_url, _download_content
+            
+            # Always check existing cookies first on user's URL for maximum speed
+            if os.path.exists(user_cookie_path):
+                logger.info(f"Checking existing YouTube cookies on user's URL for user {user_id}")
+                if test_youtube_cookies_on_url(user_cookie_path, url, user_id):
+                    cookie_file = user_cookie_path
+                    logger.info(f"Existing YouTube cookies work on user's URL for user {user_id} - using them")
+                else:
+                    logger.info(f"Existing YouTube cookies failed on user's URL, trying to get new ones for user {user_id}")
+                    cookie_urls = get_youtube_cookie_urls()
+                    if cookie_urls:
+                        # Получаем только непроверенные источники для этого пользователя
+                        from COMMANDS.cookies_cmd import get_unchecked_cookie_sources, mark_cookie_source_checked
+                        unchecked_indices = get_unchecked_cookie_sources(user_id, cookie_urls)
+                        if not unchecked_indices:
+                            logger.warning(f"All cookie sources have been checked for user {user_id}, no more sources to try")
+                            cookie_file = None
+                        else:
+                            success = False
+                            for i, idx in enumerate(unchecked_indices, 1):
+                                cookie_url = cookie_urls[idx]
+                                logger.info(f"Trying YouTube cookie source {idx + 1}/{len(cookie_urls)} for user {user_id}")
+                                
+                                # Отмечаем источник как проверенный
+                                mark_cookie_source_checked(user_id, idx)
+                                
+                                try:
+                                    ok, status, content, err = _download_content(cookie_url, timeout=30, user_id=user_id)
+                                    if ok and content and len(content) <= 100 * 1024:
+                                        with open(user_cookie_path, "wb") as cf:
+                                            cf.write(content)
+                                        if test_youtube_cookies_on_url(user_cookie_path, url, user_id):
+                                            cookie_file = user_cookie_path
+                                            logger.info(f"YouTube cookies from source {idx + 1} work on user's URL for user {user_id} - saved to user folder")
+                                            success = True
+                                            break
+                                        else:
+                                            if os.path.exists(user_cookie_path):
+                                                os.remove(user_cookie_path)
+                                except Exception as e:
+                                    logger.error(f"Error processing YouTube cookie source {idx + 1} for user {user_id}: {e}")
+                                    continue
+                            if not success:
+                                cookie_file = None
+                                logger.warning(f"All YouTube cookie sources failed for user {user_id}, will try without cookies")
+                    else:
+                        cookie_file = None
+                        logger.warning(f"No YouTube cookie sources configured for user {user_id}, will try without cookies")
+            else:
+                logger.info(f"No YouTube cookies found for user {user_id}, attempting to get new ones")
+                cookie_urls = get_youtube_cookie_urls()
+                if cookie_urls:
+                    # Получаем только непроверенные источники для этого пользователя
+                    from COMMANDS.cookies_cmd import get_unchecked_cookie_sources, mark_cookie_source_checked
+                    unchecked_indices = get_unchecked_cookie_sources(user_id, cookie_urls)
+                    if not unchecked_indices:
+                        logger.warning(f"All cookie sources have been checked for user {user_id}, no more sources to try")
+                        cookie_file = None
+                    else:
+                        success = False
+                        for i, idx in enumerate(unchecked_indices, 1):
+                            cookie_url = cookie_urls[idx]
+                            logger.info(f"Trying YouTube cookie source {idx + 1}/{len(cookie_urls)} for user {user_id}")
+                            
+                            # Отмечаем источник как проверенный
+                            mark_cookie_source_checked(user_id, idx)
+                            
+                            try:
+                                ok, status, content, err = _download_content(cookie_url, timeout=30, user_id=user_id)
+                                if ok and content and len(content) <= 100 * 1024:
+                                    with open(user_cookie_path, "wb") as cf:
+                                        cf.write(content)
+                                    if test_youtube_cookies_on_url(user_cookie_path, url, user_id):
+                                        cookie_file = user_cookie_path
+                                        logger.info(f"YouTube cookies from source {idx + 1} work on user's URL for user {user_id} - saved to user folder")
+                                        success = True
+                                        break
+                                    else:
+                                        if os.path.exists(user_cookie_path):
+                                            os.remove(user_cookie_path)
+                            except Exception as e:
+                                logger.error(f"Error processing YouTube cookie source {idx + 1} for user {user_id}: {e}")
+                                continue
+                        if not success:
+                            cookie_file = None
+                            logger.warning(f"All YouTube cookie sources failed for user {user_id}, will try without cookies")
+                else:
+                    cookie_file = None
+                    logger.warning(f"No YouTube cookie sources configured for user {user_id}, will try without cookies")
+        else:
+            # For non-YouTube URLs, use new cookie fallback system
+            from COMMANDS.cookies_cmd import get_cookie_cache_result, try_non_youtube_cookie_fallback
+            cache_result = get_cookie_cache_result(user_id, url)
+            
+            if cache_result and cache_result['result']:
+                # Use cached successful cookies
+                cookie_file = cache_result['cookie_path']
+                logger.info(f"Using cached cookies for non-YouTube audio URL: {url}")
+            else:
+                # Try user cookies first
+                if os.path.exists(user_cookie_path):
+                    cookie_file = user_cookie_path
+                    logger.info(f"Using user cookies for non-YouTube audio URL: {url}")
+                else:
+                    # No user cookies, will try fallback during download
+                    cookie_file = None
+                    logger.info(f"No user cookies found for non-YouTube audio URL: {url}, will try fallback during download")
+        last_update = 0
+        last_update = 0
+        progress_start_time = time.time()
+        current_total_process = ""
+        successful_uploads = 0
+        
+        # Check if this is an HLS stream (needed for progress_hook)
+        # This will be updated later based on actual format detection
+        is_hls = ("m3u8" in url.lower())
+
+        def progress_hook(d):
+            messages = safe_get_messages(message.chat.id)
+            nonlocal last_update, is_hls
+            # Check if /clean was called for this user → abort download
+            if _cancel_ev.is_set():
+                raise Exception("Download cancelled by user (/clean)")
+            # Check the timeout
+            if check_download_timeout(user_id):
+                raise Exception(f"Download timeout exceeded ({Config.DOWNLOAD_TIMEOUT // 3600} hours)")
+            current_time = time.time()
+            
+            def build_progress_metadata(downloaded_bytes, total_bytes):
+                info_dict = d.get("info_dict") or {}
+                fmt = info_dict.get("requested_formats", [{}])[-1] if info_dict.get("requested_formats") else info_dict
+                filesize = (
+                    total_bytes
+                    or fmt.get("filesize")
+                    or fmt.get("filesize_approx")
+                    or info_dict.get("filesize")
+                    or info_dict.get("filesize_approx")
+                )
+                metadata_payload = {
+                    "downloaded_bytes": downloaded_bytes,
+                    "total_bytes": total_bytes,
+                    "filesize": filesize,
+                    "duration": info_dict.get("duration"),
+                    "bitrate": fmt.get("abr") or info_dict.get("abr"),
+                    "ext": fmt.get("ext") or info_dict.get("ext"),
+                    "speed": d.get("speed"),
+                    "eta": d.get("eta"),
+                    "domain": urlparse(url).netloc,
+                    "thumbnail": info_dict.get("thumbnail"),
+                }
+                return {k: v for k, v in metadata_payload.items() if v is not None}
+            
+            # Calculate elapsed time and minutes passed
+            elapsed = max(0, current_time - progress_start_time)
+            minutes_passed = int(elapsed // 60)
+            
+            # Adaptive throttle: linear; after 1h fixed 90s
+            if minutes_passed and minutes_passed >= 60:
+                interval = 90.0
+            else:
+                interval = 3.0 + max(0, minutes_passed // 5)
+            
+            if current_time - last_update < interval:
+                return
+                
+            if d.get("status") == "downloading":
+                downloaded = d.get("downloaded_bytes", 0)
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                percent = (downloaded / total * 100) if total else 0
+                blocks = int(percent // 10)
+                bar = "🟩" * blocks + "⬜️" * (10 - blocks)
+                
+                # Обновляем прогресс в статистике
+                try:
+                    update_download_progress(
+                        user_id=user_id,
+                        progress=percent,
+                        url=url,
+                        title=title,
+                        metadata=build_progress_metadata(downloaded, total),
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to update download progress: {e}")
+                
+                # For HLS audio, update progress data for cycle animation
+                if hasattr(progress_hook, 'progress_data') and progress_hook.progress_data:
+                    progress_hook.progress_data['downloaded_bytes'] = downloaded
+                    progress_hook.progress_data['total_bytes'] = total
+                
+                try:
+                    # Явная подпись стадии downloading (как у uploading), чтобы было понятно, какому этапу принадлежит прогресс-бар
+                    safe_edit_message_text(user_id, proc_msg_id, safe_get_messages(user_id).AUDIO_DOWNLOADING_PROGRESS_MSG.format(process=current_total_process, bar=bar, percent=percent))
+                except Exception as e:
+                    logger.error(f"Error updating progress: {e}")
+                last_update = current_time
+            elif d.get("status") == "finished":
+                # Обновляем прогресс до 100% при завершении
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                try:
+                    update_download_progress(
+                        user_id=user_id,
+                        progress=100.0,
+                        url=url,
+                        title=title,
+                        metadata=build_progress_metadata(total or 0, total or 0),
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to update download progress on finish: {e}")
+                try:
+                    full_bar = "🟩" * 10
+                    safe_edit_message_text(user_id, proc_msg_id,
+                        f"{current_total_process}\n{safe_get_messages(user_id).ALWAYS_ASK_DOWNLOADING_QUALITY_MSG} audio:\n{full_bar}   100.0%\n{safe_get_messages(user_id).AUDIO_DOWNLOAD_FINISHED_PROCESSING_MSG}")
+                except Exception as e:
+                    logger.error(f"Error updating progress: {e}")
+                last_update = current_time
+            elif d.get("status") == "error":
+                # Сбрасываем прогресс при ошибке
+                downloaded = d.get("downloaded_bytes", 0)
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                try:
+                    update_download_progress(
+                        user_id=user_id,
+                        progress=None,
+                        url=url,
+                        title=title,
+                        metadata=build_progress_metadata(downloaded, total),
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to update download progress on error: {e}")
+                try:
+                    safe_edit_message_text(user_id, proc_msg_id, safe_get_messages(user_id).AUDIO_DOWNLOAD_ERROR_MSG)
+                except Exception as e:
+                    logger.error(f"Error updating progress: {e}")
+                last_update = current_time
+
+        # One-time retry guards to avoid infinite retry loops across attempts
+        # (already initialized at the beginning of the function)
+
+        def try_download_audio(url, current_index):
+            messages = safe_get_messages(message.chat.id)
+            nonlocal current_total_process, did_cookie_retry, did_proxy_retry, did_live_from_start_retry, did_format_fallback, _audio_format_fallback, is_hls, is_reverse_order, current_playlist_items_override, use_range_download, range_entries_metadata, unknown_error_message_sent, download_sections
+            download_format = _audio_format_fallback or format_override or 'ba'
+            
+            # Get user's audio format preference from args_cmd
+            from COMMANDS.args_cmd import get_user_ytdlp_args
+            user_args = get_user_ytdlp_args(user_id, url)
+            audio_format = user_args.get('audio_format', 'mp3')  # Default to mp3
+            
+            # If audio_format is 'best', use mp3 as fallback
+            if audio_format == 'best':
+                audio_format = 'mp3'
+            
+            # Update is_hls based on actual URL analysis
+            is_hls = ("m3u8" in url.lower())
+            
+            if current_playlist_items_override:
+                playlist_items_value = current_playlist_items_override
+            elif is_reverse_order and is_playlist:
+                playlist_items_value = f"{current_index}:{current_index}:-1"
+            else:
+                playlist_items_value = str(current_index)
+
+            # Extract start and end times from download_sections if trim is enabled
+            trim_start_time = None
+            trim_end_time = None
+            if download_sections:
+                import re
+                trim_match = re.match(r'\*(\d{2}):(\d{2}):(\d{2})-(\d{2}):(\d{2}):(\d{2})', download_sections)
+                if trim_match:
+                    start_h, start_m, start_s, end_h, end_m, end_s = map(int, trim_match.groups())
+                    trim_start_time = f"{start_h:02d}:{start_m:02d}:{start_s:02d}"
+                    trim_end_time = f"{end_h:02d}:{end_m:02d}:{end_s:02d}"
+                    logger.info(f"[TRIM AUDIO] Extracted trim times: start={trim_start_time}, end={trim_end_time}")
+            
+            # Build postprocessors list
+            # Note: download_sections already handles trimming, so we don't need FFmpegVideoConvertor
+            # with postprocessor_args (which is not supported anyway)
+            # The trimming will be done by download_sections, then we extract audio
+            postprocessors = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': audio_format,
+                'preferredquality': '192',
+            }]
+            
+            if trim_start_time and trim_end_time:
+                logger.info(f"[TRIM AUDIO] Using download_sections for trimming: {download_sections}")
+            
+            # Add metadata postprocessor
+            postprocessors.append({
+                'key': 'FFmpegMetadata'   # equivalent to --add-metadata
+            })
+
+            # Add EmbedThumbnail postprocessor (same as video path).
+            # Uses mutagen internally — correctly embeds cover art in
+            # MP3 (ID3v2), M4A (covr), OGG/OPUS/Vorbis (METADATA_BLOCK_PICTURE), FLAC.
+            # ffmpeg alone cannot embed covers in OGG/OPUS containers.
+            embed_thumbnail = user_args.get('embed_thumbnail', True) if user_args else True
+            if embed_thumbnail:
+                postprocessors.append({'key': 'EmbedThumbnail'})
+                logger.info(f"User {user_id} embed_thumbnail={embed_thumbnail}, adding EmbedThumbnail postprocessor for audio")
+            
+            ytdl_opts = {
+               'format': download_format,
+               'postprocessors': postprocessors,
+               'prefer_ffmpeg': True,
+               'extractaudio': True,
+               # Для обратного порядка используем формат START:STOP:-1, иначе просто номер
+               'playlist_items': playlist_items_value,
+               # outtmpl will be set later with sanitized title
+                # Disabled restrictfilenames to preserve Unicode filenames (Arabic, Persian, CJK, etc.)
+                'restrictfilenames': False,
+               'progress_hooks': [progress_hook],
+               'extractor_args': {
+                  'generic': {
+                      'impersonate': ['chrome']
+                  }
+               },
+               'referer': url,
+               'geo_bypass': True,
+               # check_certificate and no_check_certificates are set from user_args (default: check_certificate=False, no_check_certificates=True)
+               'live_from_start': True if not did_live_from_start_retry else False,
+               'writesubtitles': False,  # Disable subtitles for audio
+               'writeautomaticsub': False,  # Disable auto subtitles for audio
+               # JS runtime for YouTube n-parameter challenge solving.
+               # Without this, yt-dlp can't extract formats ("Only images are available")
+               'js_runtimes': {'node': {}},
+               # Network resilience: retry on transient failures
+                'retries': 5,
+                'fragment_retries': 10,
+                 'file_access_retries': 3,
+                 'socket_timeout': 60,
+                 'source_address': '0.0.0.0',
+              }
+            
+            # Add download_sections if trim is enabled
+            if download_sections:
+                ytdl_opts['download_sections'] = [download_sections]
+                logger.info(f"[TRIM AUDIO] Added download_sections: {download_sections} for user {user_id}")
+            
+            # Configure HLS-specific options if detected
+            if is_hls:
+                ytdl_opts["downloader"] = "ffmpeg"
+                ytdl_opts["hls_prefer_native"] = False
+                ytdl_opts["hls_use_mpegts"] = True
+                ytdl_opts.pop("http_chunk_size", None)
+                # Reduce parallelism for fragile HLS endpoints
+                ytdl_opts["concurrent_fragment_downloads"] = 1
+                
+                # Если используется прокси - добавляем параметры для быстрого прерывания при ошибках 403
+                # чтобы не ждать 20 минут в бесконечном цикле повторов
+                if ytdl_opts.get('proxy'):
+                    logger.info("HLS stream with proxy detected - adding fast-fail options to prevent infinite 403 retries")
+                    # Используем native HLS downloader вместо ffmpeg, чтобы параметры работали
+                    ytdl_opts["hls_prefer_native"] = True
+                    ytdl_opts["downloader"] = "native"  # Используем native downloader для HLS
+                    ytdl_opts["fragment_retries"] = 3
+                    ytdl_opts["hls_fragment_retries"] = 3
+                    ytdl_opts["abort_on_unavailable_fragment"] = True
+                    # Добавляем таймаут для downloader_args (на случай если native не сработает)
+                    if "downloader_args" not in ytdl_opts:
+                        ytdl_opts["downloader_args"] = {}
+                    ytdl_opts["downloader_args"]["ffmpeg"] = ["-timeout", "10000000"]  # 10 секунд таймаут для ffmpeg
+                    logger.info("Fast-fail options applied: hls_prefer_native=True, fragment_retries=3, hls_fragment_retries=3, abort_on_unavailable_fragment=True")
+            
+            # Define sanitize_title_for_filename function
+            def sanitize_title_for_filename(title):
+                messages = safe_get_messages(message.chat.id)
+                """Sanitize title for filename preserving Unicode (Arabic, Persian, CJK, etc.)"""
+                if not title:
+                    return "audio"
+                from HELPERS.filesystem_hlp import sanitize_filename
+                return sanitize_filename(title)
+            
+            # Title sanitization is now handled manually before second extract_info call
+            
+            # Add match_filter for domain filtering only (no title sanitization needed)
+            if not is_no_filter_domain(url):
+                ytdl_opts['match_filter'] = create_smart_match_filter(user_id=user_id, message=message)
+            else:
+                logger.info(f"Skipping domain filter for domain in NO_FILTER_DOMAINS: {url}")
+            
+            # Add user's custom yt-dlp arguments
+            from COMMANDS.args_cmd import get_user_ytdlp_args, log_ytdlp_options
+            user_args = get_user_ytdlp_args(user_id, url)
+            
+            # Check if user wants to ignore errors (default is False)
+            # Note: ignore_errors is converted to ignoreerrors in get_user_ytdlp_args
+            ignore_errors = user_args.get('ignoreerrors', False) if user_args else False
+            
+            if user_args:
+                # writethumbnail will be set from user_args (default True)
+                # ignoreerrors is set based on user's ignore_errors setting
+                user_args_copy = user_args.copy()
+                user_args_copy.pop('ignoreerrors', None)
+                # embed_thumbnail is already handled via EmbedThumbnail postprocessor above
+                user_args_copy.pop('embed_thumbnail', None)
+                ytdl_opts.update(user_args_copy)
+            
+            # Only use ignoreerrors if user explicitly enabled it via /args
+            ytdl_opts['ignoreerrors'] = ignore_errors
+
+            # Prevent yt-dlp from routing non-playlist URLs through playlist/tab
+            # extractors, which causes "No videos found in playlist" (issue #377).
+            if not is_playlist:
+                ytdl_opts['noplaylist'] = True
+
+            # Log final yt-dlp options for debugging
+            log_ytdlp_options(user_id, ytdl_opts, "audio_download")
+            
+            # Check if we need to use --no-cookies for this domain
+            # Also honour a thread-local cookie override set by
+            # try_non_youtube_cookie_fallback (issue #383), so the audio path
+            # actually uses different cookies per fallback strategy.
+            import threading
+            _cookie_override = getattr(threading.current_thread(), 'cookiefile_override', _NOT_SET)
+            if _cookie_override is not _NOT_SET:
+                ytdl_opts['cookiefile'] = _cookie_override  # could be None or a path
+                logger.info(f"Using thread-local cookie override for audio: {_cookie_override}")
+            elif is_no_cookie_domain(url):
+                ytdl_opts['cookiefile'] = None  # Equivalent to --no-cookies
+                logger.info(f"Using --no-cookies for domain: {url}")
+            else:
+                ytdl_opts['cookiefile'] = cookie_file
+            
+            # Add proxy configuration if needed
+            # Проверяем, есть ли прокси в thread-local storage (для retry с прокси из файла)
+            import threading
+            thread_proxy = getattr(threading.current_thread(), 'proxy_for_audio_download', None)
+            
+            from HELPERS.proxy_helper import is_no_proxy_domain, needs_auto_proxy
+            _skip_proxy = is_no_proxy_domain(url)
+            _auto_proxy = needs_auto_proxy(url)
+            if _skip_proxy:
+                logger.info(f"Domain is in NO_PROXY_DOMAINS - skipping proxy for {url}")
+                ytdl_opts.pop('proxy', None)
+                threading.current_thread().proxy_for_audio_download = None
+            elif _auto_proxy:
+                logger.info(f"Domain needs auto-proxy (AUTO_PROXY_DOMAINS or NSFW) - skipping initial proxy for {url}")
+                ytdl_opts.pop('proxy', None)
+                threading.current_thread().proxy_for_audio_download = None
+            elif thread_proxy:
+                # Используем прокси из thread-local storage (приоритет)
+                ytdl_opts['proxy'] = thread_proxy
+                logger.info(f"Using proxy from thread-local storage for audio download: {thread_proxy}")
+                # Очищаем после использования
+                threading.current_thread().proxy_for_audio_download = None
+            elif use_proxy:
+                # Force proxy for this download
+                from COMMANDS.proxy_cmd import get_proxy_config
+                proxy_config = get_proxy_config()
+                
+                if proxy_config and 'type' in proxy_config and 'ip' in proxy_config and 'port' in proxy_config:
+                    # Build proxy URL
+                    if proxy_config['type'] == 'http':
+                        if proxy_config.get('user') and proxy_config.get('password'):
+                            proxy_url = f"http://{proxy_config['user']}:{proxy_config['password']}@{proxy_config['ip']}:{proxy_config['port']}"
+                        else:
+                            proxy_url = f"http://{proxy_config['ip']}:{proxy_config['port']}"
+                    elif proxy_config['type'] == 'https':
+                        if proxy_config.get('user') and proxy_config.get('password'):
+                            proxy_url = f"https://{proxy_config['user']}:{proxy_config['password']}@{proxy_config['ip']}:{proxy_config['port']}"
+                        else:
+                            proxy_url = f"https://{proxy_config['ip']}:{proxy_config['port']}"
+                    elif proxy_config['type'] in ['socks4', 'socks5', 'socks5h']:
+                        if proxy_config.get('user') and proxy_config.get('password'):
+                            proxy_url = f"{proxy_config['type']}://{proxy_config['user']}:{proxy_config['password']}@{proxy_config['ip']}:{proxy_config['port']}"
+                        else:
+                            proxy_url = f"{proxy_config['type']}://{proxy_config['ip']}:{proxy_config['port']}"
+                    else:
+                        if proxy_config.get('user') and proxy_config.get('password'):
+                            proxy_url = f"http://{proxy_config['user']}:{proxy_config['password']}@{proxy_config['ip']}:{proxy_config['port']}"
+                        else:
+                            proxy_url = f"http://{proxy_config['ip']}:{proxy_config['port']}"
+                    
+                    ytdl_opts['proxy'] = proxy_url
+                    logger.info(f"Force using proxy for audio download: {proxy_url}")
+                else:
+                    logger.warning("Proxy requested but proxy configuration is incomplete")
+            else:
+                # Add proxy configuration if needed for this domain
+                from HELPERS.proxy_helper import add_proxy_to_ytdl_opts
+                ytdl_opts = add_proxy_to_ytdl_opts(ytdl_opts, url, user_id)   
+            
+            # Add PO token provider for YouTube domains
+            ytdl_opts = add_pot_to_ytdl_opts(ytdl_opts, url)
+
+            # Force web_creator client for age restriction retry (thread-local flag)
+            import threading
+            if getattr(threading.current_thread(), 'force_web_creator_for_audio', False):
+                yt_args = ytdl_opts.get('extractor_args', {}).get('youtube', {})
+                current_clients = yt_args.get('player_client', [])
+                if 'web_creator' not in (current_clients or []):
+                    if current_clients:
+                        current_clients = list(current_clients) + ['web_creator']
+                    else:
+                        current_clients = ['web_creator']
+                    if 'extractor_args' not in ytdl_opts:
+                        ytdl_opts['extractor_args'] = {}
+                    if 'youtube' not in ytdl_opts['extractor_args']:
+                        ytdl_opts['extractor_args']['youtube'] = {}
+                    ytdl_opts['extractor_args']['youtube']['player_client'] = current_clients
+                    logger.info(f"🔓 Forced web_creator player_client for audio age restriction retry")
+                threading.current_thread().force_web_creator_for_audio = False
+
+            # match_filter will be added later for domain filtering only
+
+            try:
+                with yt_dlp.YoutubeDL(ytdl_opts) as ydl:
+                    info_dict = ydl.extract_info(url, download=False)
+                # Normalize info_dict to dict
+                if isinstance(info_dict, list):
+                    info_dict = (info_dict[0] if len(info_dict) > 0 else {})
+                if isinstance(info_dict, dict) and "entries" in info_dict:
+                    entries = info_dict["entries"]
+                    if len(entries) > 1 and not current_playlist_items_override:  # If the video in the playlist is more than one
+                        actual_index = current_index - 1  # -1 because indexes in entries start from 0
+                        if 0 <= actual_index < len(entries):
+                            info_dict = entries[actual_index]
+                        else:
+                            raise Exception(f"Audio index {actual_index + 1} out of range (total {len(entries)})")
+                    else:
+                        # If there is only one video in the playlist, just download it
+                        info_dict = entries[0]  # Just take the first video
+                
+                # Check if this is a live stream and handle it if detection is disabled
+                # Note: Live stream audio download is not supported, so we skip it for audio
+                if info_dict and isinstance(info_dict, dict) and info_dict.get('is_live', False):
+                    if not LimitsConfig.ENABLE_LIVE_STREAM_BLOCKING:
+                        logger.warning(f"Live stream detected for audio download, but audio live streams are not supported: {url}")
+                        send_error_to_user(message, safe_get_messages(user_id).LIVE_STREAM_DETECTED_MSG + "\n\nNote: Audio extraction from live streams is not supported.")
+                        return "LIVE_STREAM"
+                
+                # Get original title and sanitize it for filename
+                original_title = info_dict.get("title", "audio")
+                logger.info(f"DEBUG: info_dict.get('title') = '{original_title}'")
+                
+                # MANUALLY apply sanitization since match_filter doesn't work with download=False
+                sanitized_title = sanitize_title_for_filename(original_title)
+                
+                # Keep original title in info_dict for metadata, but use sanitized for filename
+                info_dict['original_title'] = original_title  # Save original for caption
+                logger.info(f"MANUAL sanitization: '{original_title}' -> '{sanitized_title}'")
+                
+                # Set filename using literal sanitized title in outtmpl
+                ytdl_opts['outtmpl'] = os.path.join(user_folder, f"{sanitized_title}.%(ext)s")
+                logger.info(f"Set outtmpl to use literal filename: {sanitized_title}.%(ext)s")
+                
+                # Original title already saved above for caption
+
+                try:
+                    if is_hls:
+                        safe_edit_message_text(user_id, proc_msg_id,
+                            f"{current_total_process}\n<i>Detected HLS audio stream.\n{safe_get_messages(user_id).ALWAYS_ASK_DOWNLOADING_HLS_MSG}</i>")
+                    else:
+                        safe_edit_message_text(user_id, proc_msg_id,
+                            f"{current_total_process}\n> <i>{safe_get_messages(user_id).ALWAYS_ASK_DOWNLOADING_AUDIO_FORMAT_USING_MSG} {download_format}...</i>")
+                except Exception as e:
+                    logger.error(f"Status update error: {e}")
+                
+                # Try with proxy fallback if user proxy is enabled
+                # Initialize cycle_stop and cycle_thread for HLS at outer level to ensure cleanup on any error
+                cycle_stop = None
+                cycle_thread = None
+                if is_hls:
+                    cycle_stop = threading.Event()
+                    progress_data = {'downloaded_bytes': 0, 'total_bytes': 0}
+                    cycle_thread = start_cycle_progress(user_id, proc_msg_id, current_total_process, user_folder, cycle_stop, progress_data)
+                    # Pass cycle_stop and progress_data to progress_hook so it can update the cycle animation
+                    progress_hook.cycle_stop = cycle_stop
+                    progress_hook.progress_data = progress_data
+                
+                # Try with proxy fallback if user proxy is enabled
+                last_download_error = None
+                try:
+                    def download_operation(opts):
+                        messages = safe_get_messages(user_id)
+                        
+                        # Если используется прокси и HLS - добавляем таймаут для быстрого прерывания
+                        if is_hls and opts.get('proxy'):
+                            import signal
+                            import threading
+                            
+                            # Флаг для отслеживания ошибок 403
+                            hls_403_detected = threading.Event()
+                            
+                            # Создаем кастомный logger hook для мониторинга ошибок 403
+                            original_logger = opts.get('logger') or logger
+                            
+                            class HLS403Monitor:
+                                def error(self, msg):
+                                    if "403" in str(msg) or "HTTP error 403" in str(msg) or "Forbidden" in str(msg):
+                                        logger.warning(f"HLS 403 error detected in logger: {msg}")
+                                        hls_403_detected.set()
+                                    original_logger.error(msg)
+                                
+                                def warning(self, msg):
+                                    if "403" in str(msg) or "HTTP error 403" in str(msg) or "Forbidden" in str(msg):
+                                        logger.warning(f"HLS 403 error detected in logger: {msg}")
+                                        hls_403_detected.set()
+                                    if hasattr(original_logger, 'warning'):
+                                        original_logger.warning(msg)
+                                
+                                def debug(self, msg):
+                                    if hasattr(original_logger, 'debug'):
+                                        original_logger.debug(msg)
+                                
+                                def info(self, msg):
+                                    if hasattr(original_logger, 'info'):
+                                        original_logger.info(msg)
+                            
+                            opts['logger'] = HLS403Monitor()
+                            
+                            # Запускаем таймер для принудительного прерывания через 15 секунд
+                            def timeout_handler():
+                                time.sleep(15)  # Ждем 15 секунд
+                                if not hls_403_detected.is_set():
+                                    # Если за 15 секунд не было прогресса - прерываем
+                                    logger.warning("HLS download with proxy timeout after 15 seconds - aborting")
+                                    hls_403_detected.set()
+                            
+                            timeout_thread = threading.Thread(target=timeout_handler, daemon=True)
+                            timeout_thread.start()
+                        
+                        with yt_dlp.YoutubeDL(opts) as ydl:
+                            if is_hls and opts.get('proxy'):
+                                try:
+                                    # Запускаем скачивание в отдельном потоке для возможности прерывания
+                                    download_exception = [None]
+                                    
+                                    def download_wrapper():
+                                        try:
+                                            ydl.download([url])
+                                        except Exception as e:
+                                            download_exception[0] = e
+                                    
+                                    download_thread = threading.Thread(target=download_wrapper, daemon=True)
+                                    download_thread.start()
+                                    download_thread.join(timeout=180)  # Максимум 3 минуты для HLS загрузок
+                                    
+                                    # Проверяем, была ли обнаружена ошибка 403
+                                    if hls_403_detected.is_set():
+                                        # Try to find downloaded audio file on disk before aborting
+                                        try:
+                                            if os.path.exists(user_dir_name):
+                                                files = os.listdir(user_dir_name)
+                                                audio_files = [f for f in files if f.endswith(('.mp3', '.m4a', '.aac', '.ogg', '.wav', '.flac', '.opus', '.part'))]
+                                                # Filter out .part files that are still being downloaded
+                                                non_part_files = [f for f in audio_files if not f.endswith('.part') or (f.endswith('.part') and os.path.getsize(os.path.join(user_dir_name, f)) > 512*1024)]  # Keep .part files larger than 512KB
+                                                if non_part_files:
+                                                    logger.warning(f"HLS 403 error detected, but found downloaded audio file(s): {non_part_files[0]}, continuing processing")
+                                                    return info_dict
+                                        except Exception as check_e:
+                                            logger.debug(f"Error checking for audio files after HLS 403 error: {check_e}")
+                                        
+                                        logger.warning("HLS 403 error detected - aborting download immediately")
+                                        raise yt_dlp.utils.DownloadError("HLS 403 error detected - proxy blocked. Please try another proxy.")
+                                    
+                                    if download_thread.is_alive():
+                                        # Если поток еще работает после 15 секунд - прерываем
+                                        logger.warning("HLS download with proxy exceeded 15 second timeout - aborting")
+                                        raise yt_dlp.utils.DownloadError("HLS download with proxy timeout after 3 minutes. Try again or use a different proxy.")
+                                    
+                                    # Проверяем, была ли ошибка в потоке
+                                    if download_exception[0]:
+                                        raise download_exception[0]
+                                except yt_dlp.utils.DownloadError as e:
+                                    # Re-raise all errors
+                                    raise
+                            else:
+                                ydl.download([url])
+                        return True
+                    
+                    from HELPERS.proxy_helper import try_with_proxy_fallback
+                    result = try_with_proxy_fallback(ytdl_opts, url, user_id, download_operation)
+                    if result is not None:
+                        # If download_operation succeeded (result is True), we need to find the downloaded file
+                        # because info_dict might not be available yet
+                        if result is True and info_dict is None:
+                            # Try to find downloaded audio file on disk
+                            try:
+                                if os.path.exists(user_dir_name):
+                                    allfiles = os.listdir(user_dir_name)
+                                    # Look for audio files
+                                    audio_files = [f for f in allfiles if f.endswith(('.mp3', '.m4a', '.aac', '.ogg', '.wav', '.flac', '.opus')) and not f.endswith('.part')]
+                                    if audio_files:
+                                        logger.info(f"Found downloaded audio file after HLS 403 error recovery: {audio_files[0]}")
+                                        # info_dict will be populated later when searching for file
+                                        # Just continue to the file search logic below
+                                    else:
+                                        logger.warning(f"No audio files found after HLS 403 error recovery in {user_dir_name}")
+                            except Exception as check_e:
+                                logger.debug(f"Error checking for audio files after HLS 403 recovery: {check_e}")
+                except Exception as proxy_error:
+                    last_download_error = str(proxy_error)
+                    result = None
+                finally:
+                    # Always stop cycle animation, even if error occurred
+                    if cycle_stop is not None:
+                        cycle_stop.set()
+                    if cycle_thread is not None:
+                        cycle_thread.join(timeout=1)
+                
+                if result is None:
+                    # Проверяем, является ли это гео-ошибкой YouTube, и пробуем прокси из файла (только если прокси включен)
+                    if is_youtube_url(url) and user_id is not None:
+                        from COMMANDS.proxy_cmd import is_proxy_enabled
+                        error_to_check = last_download_error if last_download_error else "Failed to download audio with all available proxies"
+                        if is_proxy_enabled(user_id) and is_youtube_geo_error(error_to_check):
+                            logger.info(f"YouTube geo-blocked error detected in audio download for user {user_id}, attempting retry with proxy from file (matching countries only)")
+                            
+                            def try_download_audio_wrapper(url_arg, attempt_opts_dict):
+                                proxy_url = attempt_opts_dict.get('proxy')
+                                import threading
+                                if not hasattr(threading.current_thread(), 'proxy_for_audio_download'):
+                                    threading.current_thread().proxy_for_audio_download = None
+                                threading.current_thread().proxy_for_audio_download = proxy_url
+                                return try_download_audio(url_arg, current_index)
+                            
+                            retry_result = retry_download_with_proxy(
+                                user_id, url, try_download_audio_wrapper, url, {}, error_message=error_to_check
+                            )
+                            
+                            if retry_result is not None:
+                                logger.info(f"Audio download retry with proxy from file successful for user {user_id}")
+                                result = retry_result
+                            else:
+                                logger.warning(f"Audio download retry with proxy from file failed for user {user_id}")
+                    
+                    if result is None:
+                        # Use the actual download error instead of generic proxy message
+                        real_error = last_download_error if last_download_error else "Audio download failed"
+                        raise Exception(real_error)
+                
+                try:
+                    full_bar = "🟩" * 10
+                    safe_edit_message_text(user_id, proc_msg_id, safe_get_messages(user_id).AUDIO_DOWNLOAD_COMPLETE_MSG.format(process=current_total_process, bar=full_bar))
+                except Exception as e:
+                    logger.error(f"Final progress update error: {e}")
+                
+                # Cache successful cookie result for future use
+                if not is_youtube_url(url):
+                    from COMMANDS.cookies_cmd import set_cookie_cache_result
+                    cookie_file_path = ytdl_opts.get('cookiefile')
+                    if cookie_file_path and os.path.exists(cookie_file_path):
+                        set_cookie_cache_result(user_id, url, True, cookie_file_path)
+                        logger.info(f"Cached successful cookie result for audio {url}")
+                
+                # Remove protection file after successful download
+                from HELPERS.filesystem_hlp import remove_protection_file
+                remove_protection_file(user_folder)
+                
+                return info_dict
+            except yt_dlp.utils.DownloadError as e:
+                # Ensure cycle animation is stopped on error
+                if 'cycle_stop' in locals() and cycle_stop is not None:
+                    cycle_stop.set()
+                if 'cycle_thread' in locals() and cycle_thread is not None:
+                    cycle_thread.join(timeout=1)
+                
+                error_text = str(e)
+                logger.error(f"DownloadError: {error_text}")
+                
+                # Fallback: if 'ba' (best audio) format is not available, retry with
+                # worstvideo+bestaudio/worst — downloads smallest video + best audio,
+                # or worst combined format. Covers TikTok, Instagram Reels, and any
+                # other service that only serves combined video+audio streams.
+                if ("Requested format is not available" in error_text or
+                    "requested format is not available" in error_text) and not did_format_fallback:
+                    did_format_fallback = True
+                    _audio_format_fallback = 'worstvideo+bestaudio/worst'
+                    logger.info(f"Format 'ba' not available for {url}, retrying with '{_audio_format_fallback}'")
+                    retry_result = try_download_audio(url, current_index)
+                    _audio_format_fallback = None
+                    if retry_result is not None and retry_result != "POSTPROCESSING_ERROR":
+                        logger.info(f"Audio format fallback successful for user {user_id}")
+                        return retry_result
+                    logger.warning(f"Audio format fallback failed for user {user_id}")
+                
+                # Check for live stream detection (only if detection is enabled)
+                if "LIVE_STREAM_DETECTED" in error_text:
+                    if LimitsConfig.ENABLE_LIVE_STREAM_BLOCKING:
+                        live_stream_message = (
+                            safe_get_messages(user_id).LIVE_STREAM_DETECTED_MSG +
+                            "• You can see the final video length\n\n"
+                            "Once the stream is completed, you'll be able to download it as a regular video."
+                        )
+                        send_error_to_user(message, live_stream_message)
+                        return "LIVE_STREAM"
+                    # If detection is disabled, continue with live stream download
+                    # This will be handled by the live stream download function
+                
+                # Check for postprocessing errors (including conversion failures)
+                if "Postprocessing" in error_text:
+                    error_lower = error_text.lower()
+                    
+                    # Check for thumbnail-related postprocessor errors (non-critical, don't stop download)
+                    thumbnail_errors = [
+                        "embedthumbnail",
+                        "embed_thumbnail",
+                        "writethumbnail", 
+                        "write_thumbnail",
+                        "thumbnail",
+                        "cover",
+                        "artwork"
+                    ]
+                    
+                    # If error is related to thumbnail postprocessing, log and continue
+                    if any(thumb_error in error_lower for thumb_error in thumbnail_errors):
+                        logger.warning(f"Thumbnail postprocessor error (non-critical, continuing): {error_text}")
+                        # Check if file was actually downloaded (info_dict exists)
+                        if info_dict:
+                            logger.info("Audio file downloaded successfully, continuing despite thumbnail error")
+                            return info_dict
+                        # If no info_dict, check if file exists on disk anyway
+                        # Postprocessors run after download, so file should exist even if info_dict is missing
+                        try:
+                            # Try to find downloaded file in user directory
+                            if os.path.exists(user_folder):
+                                files = os.listdir(user_folder)
+                                # Look for audio files (common extensions)
+                                audio_files = [f for f in files if f.endswith(('.mp3', '.m4a', '.opus', '.ogg', '.flac', '.wav', '.aac'))]
+                                if audio_files:
+                                    logger.info(f"Found audio file(s) despite thumbnail error: {audio_files[0]}, continuing")
+                                    # Return None to let the code find the file later
+                                    return None
+                        except Exception as check_e:
+                            logger.debug(f"Error checking for files: {check_e}")
+                        # If we can't verify file exists, log warning but don't stop - let normal error handling proceed
+                        logger.warning("Thumbnail error detected but cannot verify file existence - letting normal error handling proceed")
+                        # Don't return here - let it fall through to normal error handling
+                    
+                    # Check for conversion failed errors (case-insensitive)
+                    if "conversion failed" in error_lower:
+                        # Try to find downloaded audio file on disk before sending error
+                        try:
+                            if os.path.exists(user_dir_name):
+                                files = os.listdir(user_dir_name)
+                                audio_files = [f for f in files if f.endswith(('.mp3', '.m4a', '.aac', '.ogg', '.wav', '.flac', '.opus'))]
+                                if audio_files:
+                                    logger.info(f"Found audio file(s) despite conversion error: {audio_files[0]}, continuing processing")
+                                    if info_dict:
+                                        return info_dict
+                        except Exception as check_e:
+                            logger.debug(f"Error checking for audio files after conversion error: {check_e}")
+                        
+                        # Only send error if no file found
+                        postprocessing_message = (
+                            safe_get_messages(user_id).AUDIO_FILE_PROCESSING_ERROR_INVALID_CHARS_MSG +
+                            "**Possible causes:**\n"
+                            "• Audio format conversion failed\n"
+                            "• Corrupted or incomplete download\n"
+                            "• Unsupported codec or format\n"
+                            "• Insufficient system resources\n\n"
+                            "**Solutions:**\n"
+                            "• Try downloading again - the system will retry automatically\n"
+                            "• Try a different quality or format\n"
+                            "• Check if you have enough disk space\n"
+                            "• If the problem persists, the audio source may be incompatible\n"
+                        )
+                        send_error_to_user(message, postprocessing_message)
+                        logger.error(f"Postprocessing conversion error: {error_text}")
+                        return "POSTPROCESSING_ERROR"
+                    elif "error opening output files" in error_lower:
+                        # Try to find downloaded audio file on disk before sending error
+                        try:
+                            if os.path.exists(user_dir_name):
+                                files = os.listdir(user_dir_name)
+                                audio_files = [f for f in files if f.endswith(('.mp3', '.m4a', '.aac', '.ogg', '.wav', '.flac', '.opus'))]
+                                if audio_files:
+                                    logger.info(f"Found audio file(s) despite output file error: {audio_files[0]}, continuing processing")
+                                    if info_dict:
+                                        return info_dict
+                        except Exception as check_e:
+                            logger.debug(f"Error checking for audio files after output file error: {check_e}")
+                        
+                        # Only send error if no file found
+                        postprocessing_message = (
+                            safe_get_messages(user_id).AUDIO_FILE_PROCESSING_ERROR_INVALID_CHARS_MSG +
+                            "**Solutions:**\n"
+                            "• Try downloading again - the system will use a safer filename\n"
+                            "• If the problem persists, the audio title may contain unsupported characters\n"
+                            "• Consider using a different audio source if available\n\n"
+                            "The download will be retried automatically with a cleaned filename."
+                        )
+                        send_error_to_user(message, postprocessing_message)
+                        logger.error(f"Postprocessing error: {error_text}")
+                        return "POSTPROCESSING_ERROR"
+                
+                # Check for postprocessing errors with Invalid argument
+                if "Postprocessing" in error_text and "Invalid argument" in error_text:
+                    # Try to find downloaded audio file on disk before sending error
+                    try:
+                        if os.path.exists(user_dir_name):
+                            files = os.listdir(user_dir_name)
+                            audio_files = [f for f in files if f.endswith(('.mp3', '.m4a', '.aac', '.ogg', '.wav', '.flac', '.opus'))]
+                            if audio_files:
+                                logger.info(f"Found audio file(s) despite invalid argument error: {audio_files[0]}, continuing processing")
+                                if info_dict:
+                                    return info_dict
+                    except Exception as check_e:
+                        logger.debug(f"Error checking for audio files after invalid argument error: {check_e}")
+                    
+                    logger.error(f"Postprocessing error (Invalid argument): {error_text}")
+                    return "POSTPROCESSING_ERROR"
+                
+                # Check for --live-from-start error and retry with --no-live-from-start
+                if "--live-from-start is passed, but there are no formats that can be downloaded from the start" in error_text and not did_live_from_start_retry:
+                    logger.info(f"Live-from-start error detected for user {user_id}, retrying with --no-live-from-start")
+                    did_live_from_start_retry = True
+                    # Retry the download with live_from_start disabled
+                    retry_result = try_download_audio(url, current_index)
+                    if retry_result is not None:
+                        logger.info(f"Audio download retry with --no-live-from-start successful for user {user_id}")
+                        return retry_result
+                    else:
+                        logger.warning(f"Audio download retry with --no-live-from-start failed for user {user_id}")
+                        # Continue with normal error handling below
+                
+                # Check for incomplete download errors ("Got error: N bytes read, M more expected")
+                # Network interruption during download — skip retries (issue #384 parity with video path)
+                if "bytes read," in error_text and "more expected" in error_text:
+                    logger.warning(f"Incomplete audio download detected (network interruption): {error_text}")
+                    try:
+                        if os.path.exists(user_dir_name):
+                            _files = os.listdir(user_dir_name)
+                            _audio_files = [f for f in _files if f.endswith(('.mp3', '.m4a', '.aac', '.ogg', '.wav', '.flac', '.opus'))]
+                            if _audio_files and info_dict:
+                                logger.info("Partial audio download exists on disk, attempting to continue")
+                                return info_dict
+                    except Exception as _check_e:
+                        logger.debug(f"Error checking for audio files after incomplete download: {_check_e}")
+                    from HELPERS.logger import log_error_to_channel
+                    log_error_to_channel(message, f"Incomplete audio download: {error_text[:300]}", url)
+                    return "NETWORK_ERROR"
+
+                # Check for rename errors (.part file missing during rename) — issue #385 parity with video path
+                if "Unable to rename file" in error_text:
+                    logger.warning(f"Audio file rename error detected: {error_text}")
+                    import re as _re
+                    _dest_match = _re.search(r"-> '([^']+)'", error_text)
+                    if _dest_match:
+                        _dest_path = _dest_match.group(1)
+                        if os.path.exists(_dest_path):
+                            logger.info(f"Destination audio file exists despite rename error: {_dest_path}")
+                            return info_dict
+                    _src_match = _re.search(r"'([^']+\.part)'", error_text)
+                    if _src_match:
+                        _src_path = _src_match.group(1)
+                        if os.path.exists(_src_path):
+                            _dest_path2 = _src_path[:-5]
+                            try:
+                                os.rename(_src_path, _dest_path2)
+                                logger.info(f"Manually renamed {_src_path} -> {_dest_path2}")
+                                return info_dict
+                            except Exception as _rename_err:
+                                logger.error(f"Manual audio rename also failed: {_rename_err}")
+                    logger.error(f"Audio file rename error, retrying with next attempt: {error_text}")
+                    from HELPERS.logger import log_error_to_channel
+                    log_error_to_channel(message, f"Audio file rename error: {error_text[:300]}", url)
+                    return None
+
+                # Auto-fallback to gallery-dl (/img) for all supported errors
+                # Но НЕ для аудио, так как gallery-dl не умеет скачивать аудио
+                # В down_and_audio.py мы НЕ делаем fallback на gallery-dl, так как это аудио функция
+                # gallery-dl предназначен только для изображений и видео, не для аудио
+                if False:  # Отключаем fallback на gallery-dl для аудио
+                    try:
+                        from COMMANDS.image_cmd import image_command
+                        from HELPERS.safe_messeger import fake_message
+                    except Exception as imp_e:
+                        logger.error(f"Failed to import gallery-dl fallback handlers: {imp_e}")
+                    else:
+                        try:
+                            safe_edit_message_text(user_id, proc_msg_id,
+                                f"{current_total_process}\n🔄 yt-dlp failed, trying gallery-dl…")
+                        except Exception:
+                            pass
+                        try:
+                            # Check if content is NSFW for fallback
+                            from HELPERS.porn import is_porn
+                            is_nsfw = is_porn(url, "", "", None) or user_forced_nsfw
+                            logger.info(f"[FALLBACK] is_porn check for {url}: {is_porn(url, '', '', None)}, user_forced_nsfw: {user_forced_nsfw}, final is_nsfw: {is_nsfw}")
+                            
+                            # ЖЕСТКО: Используем сохраненный оригинальный текст с диапазоном
+                            logger.info(f"[FALLBACK DEBUG] Using saved original_message_text: {original_message_text}")
+                            
+                            # Ищем URL с диапазоном *start*end
+                            import re
+                            range_url_match = re.search(r'(https?://[^\s\*#]+)\*(\d+)\*(\d+)', original_message_text)
+                            if range_url_match:
+                                parsed_url = range_url_match.group(1)
+                                start_range = int(range_url_match.group(2))
+                                end_range = int(range_url_match.group(3))
+                                logger.info(f"[FALLBACK DEBUG] FOUND RANGE: {parsed_url} with range {start_range}-{end_range}")
+                            else:
+                                # Fallback к обычному URL
+                                m = re.search(r'https?://[^\s\*#]+', original_message_text)
+                                parsed_url = m.group(0) if m else original_message_text
+                                start_range = 1
+                                end_range = 1
+                                logger.info(f"[FALLBACK DEBUG] NO RANGE FOUND, using url: {parsed_url}")
+                            
+                            # Build fallback command for single item only (not entire range)
+                            # Use current_index instead of full range to download only the failed item
+                            current_item_index = current_index + 1  # current_index is 0-based, we need 1-based
+                            fallback_text = f"/img {current_item_index}-{current_item_index} {parsed_url}"
+                            logger.info(f"[FALLBACK] Downloading only failed item {current_item_index} via gallery-dl, fallback_text: {fallback_text}")
+                            
+                            if tags:
+                                tags_text = ' '.join(tags)
+                                fallback_text += f" {tags_text}"
+                            
+                            # Add NSFW tag if content is detected as NSFW
+                            if is_nsfw and "#nsfw" not in fallback_text.lower():
+                                fallback_text += " #nsfw"
+                                logger.info(f"[FALLBACK] Added #nsfw tag for NSFW content: {url}")
+                            
+                            # For groups, preserve original chat_id and message_thread_id
+                            original_chat_id = message.chat.id if hasattr(message, 'chat') else user_id
+                            message_thread_id = getattr(message, 'message_thread_id', None) if hasattr(message, 'message_thread_id') else None
+                            image_command(app, fake_message(fallback_text, user_id, original_chat_id=original_chat_id, message_thread_id=message_thread_id, original_message=message))
+                            logger.info(f"Triggered gallery-dl fallback via /img from audio downloader, is_nsfw={is_nsfw}, range={start_range}-{end_range}")
+                            return "IMG"
+                        except Exception as call_e:
+                            logger.error(f"Failed to trigger gallery-dl fallback from audio downloader: {call_e}")
+                
+                # Проверяем, связана ли ошибка с региональными ограничениями YouTube
+                if is_youtube_url(url):
+                    # НО: если все прокси уже провалились - не пытаемся снова
+                    if "Failed to download audio with all available proxies" in error_text:
+                        logger.warning(f"All proxies already failed for audio, skipping proxy retry")
+                    elif is_youtube_geo_error(error_text) and not did_proxy_retry:
+                        from COMMANDS.proxy_cmd import is_proxy_enabled
+                        if not is_proxy_enabled(user_id):
+                            logger.info(f"Proxy not enabled for user {user_id}, skipping geo retry with proxy for audio")
+                        else:
+                            logger.debug(f"Checking geo-error in audio: is_youtube_geo_error={is_youtube_geo_error(error_text)}, did_proxy_retry={did_proxy_retry}, error_text[:200]={error_text[:200]}")
+                            logger.info(f"YouTube geo-blocked error detected for user {user_id}, attempting retry with proxy from file (matching countries only)")
+                            logger.info(f"Full error message: {error_text}")
+                            
+                            def try_download_audio_wrapper(url_arg, attempt_opts_dict):
+                                proxy_url = attempt_opts_dict.get('proxy')
+                                import threading
+                                if not hasattr(threading.current_thread(), 'proxy_for_audio_download'):
+                                    threading.current_thread().proxy_for_audio_download = None
+                                threading.current_thread().proxy_for_audio_download = proxy_url
+                                return try_download_audio(url_arg, current_index)
+                            
+                            retry_result = retry_download_with_proxy(
+                                user_id, url, try_download_audio_wrapper, url, {}, error_message=error_text
+                            )
+                            
+                            if retry_result is not None:
+                                logger.info(f"Audio download retry with proxy successful for user {user_id}")
+                                did_proxy_retry = True
+                                return retry_result
+                            else:
+                                logger.warning(f"All matching proxies from file failed for user {user_id}, will show error to user")
+                                did_proxy_retry = True
+                    elif is_youtube_geo_error(error_text):
+                        logger.info(f"Geo-error detected in audio but proxy retry already attempted, skipping")
+                    
+                    # Age restriction retry с web_creator client
+                    if is_age_restriction_error(error_text):
+                        logger.info(f"YouTube age restriction detected in audio download for user {user_id}, attempting retry with web_creator client")
+                        try:
+                            import threading
+                            threading.current_thread().force_web_creator_for_audio = True
+                            retry_result = try_download_audio(url, current_index)
+                        except Exception as age_retry_error:
+                            logger.warning(f"web_creator audio retry failed for user {user_id}: {age_retry_error}")
+                            retry_result = None
+                        
+                        if retry_result is not None:
+                            logger.info(f"Audio download retry with web_creator successful for user {user_id}")
+                            return retry_result
+                        else:
+                            logger.warning(f"web_creator audio retry failed for user {user_id}, continuing with other retry methods")
+                else:
+                    # Для не-YouTube сайтов пробуем перебор куки
+                    logger.info(f"Non-YouTube audio download error detected for user {user_id}, attempting cookie fallback")
+                    
+                    # Проверяем, связана ли ошибка с куки
+                    error_str = error_text.lower()
+                    if any(keyword in error_str for keyword in ['cookie', 'auth', 'login', 'sign in', '403', '401', 'forbidden', 'unauthorized']):
+                        logger.info(f"Error appears to be cookie-related for {url}, trying cookie fallback")
+                        
+                        # Пробуем перебор куки с новой системой
+                        from COMMANDS.cookies_cmd import try_non_youtube_cookie_fallback
+                        retry_result = try_non_youtube_cookie_fallback(
+                            user_id, url, try_download_audio, url, current_index
+                        )
+                        
+                        if retry_result is not None:
+                            logger.info(f"Audio download retry with cookie fallback successful for user {user_id}")
+                            return retry_result
+                        else:
+                            logger.warning(f"Audio download retry with cookie fallback failed for user {user_id}")
+                    else:
+                        logger.info(f"Error appears to be non-cookie-related for {url}, skipping cookie fallback")
+                
+                # Check if this is a skippable video error (private error for specific video in playlist)
+                # This check should be done before sending error message to avoid stopping entire playlist
+                if is_playlist and is_skippable_video_error(error_text):
+                    logger.info(f"Skipping audio at index {current_index} due to skippable error: {error_text[:100]}")
+                    # Send a brief notification to user about skipping this audio
+                    skip_message = f"⏭️ Пропущено аудио #{current_index + 1}: {error_text[:150]}"
+                    send_to_user(message, skip_message)
+                    return "SKIP"  # Skip this audio and continue with next
+                
+                # Send full error message with instructions immediately (only once)
+                if not getattr(down_and_audio, '_error_message_sent', False):
+                    # Extract error code and description from yt-dlp error
+                    error_code = "UNKNOWN_ERROR"
+                    error_description = error_text
+                    
+                    # Try to extract specific error codes
+                    if "HTTP Error 403" in error_text:
+                        error_code = "HTTP_403_FORBIDDEN"
+                        error_description = "Access forbidden - may need cookies or authentication"
+                    elif "HTTP Error 401" in error_text:
+                        error_code = "HTTP_401_UNAUTHORIZED"
+                        error_description = "Authentication required - cookies needed"
+                    elif "Video unavailable" in error_text:
+                        error_code = "VIDEO_UNAVAILABLE"
+                        error_description = "Video is not available or has been removed"
+                    elif "Private video" in error_text:
+                        error_code = "PRIVATE_VIDEO"
+                        error_description = "Video is private and requires authentication"
+                    elif "premieres in" in error_text.lower() or "premieres on" in error_text.lower():
+                        error_code = "PREMIERE_PENDING"
+                        error_description = "🎬 This video is a premiere that hasn't started yet. Please come back later when the premiere begins."
+                    elif "Sign in to confirm" in error_text:
+                        error_code = "SIGN_IN_REQUIRED"
+                        error_description = "Sign in required - cookies needed"
+                        # Автоматический rotate IP при SIGN_IN_REQUIRED
+                        try:
+                            from services.system_service import rotate_ip
+                            logger.warning(f"Auto-rotating IP due to SIGN_IN_REQUIRED error for user {user_id}")
+                            rotate_result = rotate_ip()
+                            if rotate_result.get("status") == "ok":
+                                logger.info(f"IP rotated successfully: IPv4={rotate_result.get('ipv4')}, IPv6={rotate_result.get('ipv6')}")
+                            else:
+                                logger.error(f"Failed to auto-rotate IP: {rotate_result.get('message')}")
+                        except Exception as rotate_error:
+                            logger.error(f"Error during auto-rotate IP: {rotate_error}")
+                    elif "No video formats found" in error_text:
+                        error_code = "NO_FORMATS"
+                        error_description = "No downloadable formats available"
+                    elif "Unsupported URL" in error_text:
+                        error_code = "UNSUPPORTED_URL"
+                        error_description = "This URL is not supported by yt-dlp"
+                    elif "does not have a" in error_text and ("tab" in error_text or "post" in error_text.lower()):
+                        error_code = "UNSUPPORTED_CONTENT"
+                        error_description = "This is a community post or tab page, not a downloadable video. Please send a direct video link."
+                    elif "412" in error_text and ("precondition" in error_text.lower() or "Precondition Failed" in error_text):
+                        error_code = "HTTP_412"
+                        error_description = "The website rejected the request (HTTP 412 — anti-bot protection). This site may require cookies or may not be supported."
+                    elif "Error receiving available formats" in error_text or "error receiving available formats" in error_text.lower():
+                        error_code = "FORMAT_EXTRACTION_ERROR"
+                        error_description = "Could not retrieve video formats. The video may be deleted, restricted, or require authentication."
+                    elif "Postprocessing: audio conversion failed" in error_text or "received signal 2" in error_text:
+                        # FFmpeg/yt-dlp reported that audio conversion was interrupted by signal 2 (SIGINT)
+                        # Treat this as a known, user-visible error instead of UNKNOWN_ERROR
+                        error_code = "FFMPEG_INTERRUPTED"
+                        error_description = (
+                            "Audio conversion was interrupted by the system (signal 2).\n\n"
+                            "**Possible causes:**\n"
+                            "• Server or host stopped the conversion process\n"
+                            "• Resource/timeout limit was reached during ffmpeg processing\n"
+                            "• Bot was restarted or stopped while converting audio\n\n"
+                            "**What you can try:**\n"
+                            "• Send the link again and wait until conversion is finished\n"
+                            "• Try a different quality/format\n"
+                            "• If the error repeats, try later or use another source"
+                        )
+                    elif "Network error" in error_text:
+                        error_code = "NETWORK_ERROR"
+                        error_description = "Network connection failed"
+                    elif "unable to open for writing" in error_text.lower():
+                        # Output directory disappeared mid-download (cleanup
+                        # race) — parity with the video path (issue #451).
+                        error_code = "FILE_OPEN_ERROR"
+                        error_description = "Failed to create the output file — the download directory was cleared while downloading. This is a temporary issue — please try again."
+                    elif "ffmpeg exited with code" in error_text or "ERROR: ffmpeg" in error_text:
+                        error_code = "FFMPEG_ERROR"
+                        # Try to extract more details from error message
+                        if "code 1" in error_text:
+                            error_description = "FFmpeg processing failed - audio format may be incompatible or corrupted"
+                        elif "code 2" in error_text:
+                            error_description = "FFmpeg error - invalid arguments or unsupported format"
+                        else:
+                            error_description = "FFmpeg processing error occurred"
+                        
+                        # Try to extract specific error details
+                        import re
+                        ffmpeg_details = re.search(r'ffmpeg.*?error[:\s]+(.*?)(?:\n|$)', error_text, re.IGNORECASE | re.DOTALL)
+                        if ffmpeg_details:
+                            details = ffmpeg_details.group(1).strip()[:200]
+                            if details:
+                                error_description += f"\n\nDetails: {details}"
+                        
+                        # Suggest solutions
+                        error_description += (
+                            "\n\n**Possible solutions:**\n"
+                            "• Try downloading with a different quality/format\n"
+                            "• The audio may be corrupted or in an unsupported format\n"
+                            "• Try downloading without post-processing\n"
+                            "• Check if ffmpeg is properly installed"
+                        )
+                    
+                    send_error_to_user(
+                        message,
+                        "<blockquote>Check <a href='https://github.com/chelaxian/tg-ytdlp-bot/wiki/YT_DLP#supported-sites'>here</a> if your site supported</blockquote>\n"
+                        "<blockquote>You may need <code>cookie</code> for downloading this audio. First, clean your workspace via <b>/clean</b> command</blockquote>\n"
+                        "<blockquote>For Youtube - get <code>cookie</code> via <b>/cookie</b> command. For any other supported site - send your own cookie (<a href='https://t.me/tg_ytdlp/203'>guide1</a>) (<a href='https://t.me/tg_ytdlp/214'>guide2</a>) and after that send your audio link again.</blockquote>\n"
+                        f"────────────────\n"
+                        f"❌ <b>Error Code:</b> <code>{error_code}</code>\n"
+                        f"📝 <b>Description:</b> {error_description}\n"
+                        f"🔧 <b>Full Error:</b> <code>{error_text}</code>"
+                    )
+                    down_and_audio._error_message_sent = True
+                return None
+            except Exception as e:
+                error_text = str(e)
+                logger.error(f"Audio download attempt failed: {e}")
+                logger.debug(f"Error message for geo-check in audio: {error_text[:500]}")
+                
+                # Если все прокси уже провалились - сразу прерываем все операции
+                if "Failed to download audio with all available proxies" in error_text:
+                    logger.warning(f"All proxies failed for audio, error already sent to user - aborting all operations immediately")
+                    if not getattr(down_and_audio, '_error_message_sent', False):
+                        # Only show proxy-specific message if user actually has proxy enabled
+                        try:
+                            from COMMANDS.proxy_cmd import is_proxy_enabled
+                            _proxy_on = is_proxy_enabled(user_id)
+                        except Exception:
+                            _proxy_on = False
+                        if _proxy_on:
+                            send_error_to_user(
+                                message,
+                                safe_get_messages(user_id).ERROR_ALL_PROXIES_FAILED_MSG
+                            )
+                        else:
+                            send_error_to_user(
+                                message,
+                                f"❌ <b>Audio download failed</b>\n\n<code>{error_text[:500]}</code>"
+                            )
+                        down_and_audio._error_message_sent = True
+                    # Прерываем все дальнейшие операции
+                    return None
+                
+                # Check if this is a "No videos found in playlist" error
+                if "No videos found in playlist" in error_text or "Story might have expired" in error_text:
+                    error_message = safe_get_messages(user_id).DOWN_UP_NO_CONTENT_FOUND_MSG.format(index=original_playlist_index)
+                    send_error_to_user(message, error_message)
+                    logger.info(f"Skipping item at index {current_index} (no content found)")
+                    return "SKIP"
+                
+                # Check if this is a TikTok infinite loop error
+                if "TikTok API keeps sending the same page" in error_text and "infinite loop" in error_text:
+                    error_message = safe_get_messages(user_id).AUDIO_TIKTOK_API_ERROR_SKIP_MSG.format(index=original_playlist_index)
+                    send_to_user(message, error_message)
+                    logger.info(f"Skipping TikTok audio at index {current_index} due to API error")
+                    return "SKIP"  # Skip this audio and continue with next
+                
+                # Check if this is a skippable video error (private error for specific video in playlist)
+                if is_playlist and is_skippable_video_error(error_text):
+                    logger.info(f"Skipping audio at index {current_index} due to skippable error: {error_text[:100]}")
+                    # Send a brief notification to user about skipping this audio
+                    skip_message = f"⏭️ Пропущено аудио #{current_index + 1}: {error_text[:150]}"
+                    send_to_user(message, skip_message)
+                    return "SKIP"  # Skip this audio and continue with next
+                
+                else:
+                    # Отправляем сообщение об ошибке только один раз, чтобы избежать спама
+                    if not unknown_error_message_sent:
+                        error_str = str(e)
+                        from CONFIG.errors import is_geo_block_error, has_country_list_in_error, is_cookie_error
+                        if is_geo_block_error(error_str):
+                            if has_country_list_in_error(error_str):
+                                send_to_user(message, f"❌ <b>Audio is geo-blocked</b>\n\n<code>{error_str[:500]}</code>\n\n💡 Enable proxy (<code>/proxy</code>) so the bot can try proxies from those countries.")
+                            else:
+                                send_to_user(message, f"❌ <b>Audio is geo-blocked in your country</b>\n\n<code>{error_str[:500]}</code>\n\n💡 Try enabling proxy (<code>/proxy</code>) or use another bot.")
+                        else:
+                            send_to_user(message, safe_get_messages(user_id).ERROR_UNKNOWN_MSG.format(error=error_str))
+                        unknown_error_message_sent = True
+                        # Send cookie hint if this is a cookie-related error
+                        if is_cookie_error(error_str):
+                            try:
+                                safe_send_message(user_id, safe_get_messages(user_id).SAVE_AS_COOKIE_HINT, reply_parameters=ReplyParameters(message_id=message.id), parse_mode=enums.ParseMode.HTML)
+                                logger.info(f"Sent cookie hint to user {user_id} after cookie-related error (audio download)")
+                            except Exception as _cookie_hint_err:
+                                logger.warning(f"Failed to send cookie hint: {_cookie_hint_err}")
+                return None
+
+        # Download thumbnail for embedding (only once for the URL)
+        thumbnail_path = None
+        try:
+            logger.info(f"Downloading thumbnail for URL: {url}")
+            # Try to download YouTube thumbnail first
+            # Безопасная проверка домена через urlparse
+            is_youtube = False
+            try:
+                from urllib.parse import urlparse
+                parsed_url = urlparse(url)
+                url_hostname = (parsed_url.hostname or '').lower()
+                is_youtube = url_hostname in ('youtube.com', 'www.youtube.com', 'youtu.be', 'www.youtu.be') or \
+                            url_hostname.endswith('.youtube.com') or url_hostname.endswith('.youtu.be')
+            except Exception:
+                pass
+            
+            if is_youtube:
+                try:
+                    # Extract YouTube video ID
+                    import re
+                    yt_id = None
+                    if "youtube.com/watch?v=" in url:
+                        yt_id = re.search(r'v=([^&]+)', url).group(1)
+                    elif "youtu.be/" in url:
+                        yt_id = re.search(r'youtu\.be/([^?]+)', url).group(1)
+                    elif "youtube.com/shorts/" in url:
+                        yt_id = re.search(r'shorts/([^?]+)', url).group(1)
+                    
+                    if yt_id:
+                        youtube_thumb_path = os.path.join(user_folder, f"yt_thumb_{yt_id}.jpg")
+                        download_thumbnail(yt_id, youtube_thumb_path, url)
+                        if os.path.exists(youtube_thumb_path):
+                            thumbnail_path = youtube_thumb_path
+                            logger.info(f"Downloaded thumbnail to download directory: {youtube_thumb_path}")
+                except Exception as e:
+                    logger.warning(f"YouTube thumbnail download failed: {e}")
+            
+            # If not YouTube or YouTube thumb not found, try universal thumbnail downloader
+            if not thumbnail_path:
+                try:
+                    universal_thumb_path = os.path.join(user_folder, "universal_thumb.jpg")
+                    if download_universal_thumbnail(url, universal_thumb_path):
+                        if os.path.exists(universal_thumb_path):
+                            thumbnail_path = universal_thumb_path
+                            logger.info(f"Downloaded universal thumbnail: {universal_thumb_path}")
+                except Exception as e:
+                    logger.info(f"Universal thumbnail not available: {e}")
+        except Exception as e:
+            logger.warning(f"Thumbnail download failed: {e}")
+
+        # Для отрицательных индексов используем весь диапазон сразу, а не цикл
+        total_playlist_count = None  # Общее количество видео в плейлисте (для преобразования отрицательных индексов)
+        has_negative_indices_for_download = False  # Флаг для отрицательных индексов (не используем range_entries_metadata)
+        if use_range_download:
+            has_negative_indices_for_download = True  # Для отрицательных индексов скачиваем каждый отдельно
+            # Для отрицательных индексов нужно получить общее количество видео из плейлиста
+            # Делаем предварительный запрос, чтобы получить общее количество видео
+            try:
+                from DOWN_AND_UP.yt_dlp_hook import get_video_formats
+                logger.info(f"Getting total playlist count for negative indices conversion (audio)...")
+                temp_info = get_video_formats(url, user_id, 1, cookies_already_checked, use_proxy, 1)
+                if temp_info and isinstance(temp_info, dict):
+                    if "entries" in temp_info:
+                        total_playlist_count = len(temp_info["entries"])
+                    elif "_playlist_entries" in temp_info:
+                        total_playlist_count = len(temp_info["_playlist_entries"])
+                if total_playlist_count:
+                    logger.info(f"Total playlist count (audio): {total_playlist_count}")
+                    # Преобразуем отрицательные индексы в положительные
+                    # -1 = последнее видео (total_playlist_count), -2 = предпоследнее (total_playlist_count - 1), и т.д.
+                    # Формула: positive_index = total_playlist_count + negative_index + 1
+                    converted_indices = []
+                    for neg_idx in playlist_indices_all:
+                        if neg_idx < 0:
+                            pos_idx = total_playlist_count + neg_idx + 1
+                            converted_indices.append(pos_idx)
+                        else:
+                            converted_indices.append(neg_idx)
+                    # Сортируем в обратном порядке для скачивания от последнего к первому
+                    converted_indices.sort(reverse=True)
+                    playlist_indices_all = converted_indices
+                    logger.info(f"Converted negative indices to positive (audio): {converted_indices}")
+            except Exception as e:
+                logger.warning(f"Failed to get total playlist count for negative indices (audio): {e}, using original indices")
+        
+        if use_range_download:
+            # Для отрицательных индексов используем весь диапазон сразу
+            # Теперь indices_to_download содержит уже преобразованные положительные индексы
+            # Для отрицательных индексов всегда используем обратный порядок (от последнего к первому)
+            indices_to_download = playlist_indices_all  # Уже отсортированы в обратном порядке
+        elif is_playlist and quality_key:
+            indices_to_download = uncached_indices
+        elif is_playlist:
+            indices_to_download = playlist_indices_all
+        else:
+            indices_to_download = range(video_count)
+        
+        # Define safe filename template for fallback
+        timestamp = int(time.time())
+        safe_outtmpl = os.path.join(user_folder, f"download_{timestamp}.%(ext)s")
+        
+        range_entries_metadata = None
+        current_playlist_items_override = None
+        for idx, current_index in enumerate(indices_to_download):
+            original_playlist_index = current_index
+            playlist_item_index = current_index if is_playlist else current_index + video_start_with
+            messages = safe_get_messages(message.chat.id)
+            total_process = f"""
+<b>📶 {safe_get_messages(user_id).TOTAL_PROGRESS_MSG}</b>
+<blockquote>{safe_get_messages(user_id).AUDIO_PROGRESS_MSG.format(current=idx + 1, total=len(indices_to_download))}</blockquote>
+"""
+
+            current_total_process = total_process
+
+            # Playlist naming is handled by yt-dlp with our custom outtmpl
+
+            # Reset retry flags for each new item in playlist
+            did_cookie_retry = False
+            did_proxy_retry = False
+            did_live_from_start_retry = False
+            unknown_error_message_sent = False  # Сбрасываем флаг для каждого нового элемента плейлиста
+            down_and_audio._error_message_sent = False  # Сбрасываем флаг для yt-dlp ошибок для каждого нового элемента плейлиста
+
+            # Для отрицательных индексов не используем reuse_range_download, скачиваем каждый индекс отдельно
+            reuse_range_download = use_range_download and range_entries_metadata is not None and not has_negative_indices_for_download
+            if reuse_range_download:
+                if idx < len(range_entries_metadata):
+                    info_dict = range_entries_metadata[idx]
+                    logger.info(f"[AUDIO RANGE] Reusing cached entry #{idx + 1} for playlist index {original_playlist_index}")
+                    result = info_dict
+                else:
+                    logger.warning(f"[AUDIO RANGE] Missing entry #{idx + 1} in cached metadata, stopping playlist download")
+                    result = None
+                    break
+            else:
+                if use_range_download:
+                    current_playlist_items_override = f"{video_start_with}:{video_end_with}:-1" if is_reverse_order else f"{video_start_with}:{video_end_with}"
+                else:
+                    current_playlist_items_override = None
+                result = try_download_audio(url, playlist_item_index)
+                current_playlist_items_override = None
+                # Для отрицательных индексов не используем range_entries_metadata, скачиваем каждый индекс отдельно
+                if use_range_download and isinstance(result, dict) and not has_negative_indices_for_download:
+                    if "entries" in result:
+                        range_entries_metadata = result.get("entries") or []
+                    else:
+                        range_entries_metadata = [result]
+                    if idx < len(range_entries_metadata):
+                        info_dict = range_entries_metadata[idx]
+                    else:
+                        logger.warning(f"[AUDIO RANGE] Download returned {len(range_entries_metadata)} entries but missing entry #{idx + 1}")
+                        break
+                    result = info_dict
+            
+            # If download failed and it's a YouTube URL, try automatic cookie retry
+            if result is None and is_youtube_url(url) and not did_cookie_retry:
+                logger.info(f"Audio download failed for user {user_id}, attempting automatic cookie retry")
+                
+                # Try retry with different cookies
+                retry_result = retry_download_with_different_cookies(
+                    user_id, url, try_download_audio, url, playlist_item_index
+                )
+                
+                if retry_result is not None:
+                    logger.info(f"Audio download retry with different cookies successful for user {user_id}")
+                    result = retry_result
+                    did_cookie_retry = True
+                else:
+                    logger.warning(f"All cookie retry attempts failed for user {user_id}")
+                    did_cookie_retry = True
+
+            if result is None:
+                with playlist_errors_lock:
+                    error_key = f"{user_id}_{playlist_name}"
+                    if error_key not in playlist_errors:
+                        playlist_errors[error_key] = True
+
+                break
+            elif isinstance(result, str):
+                # Handle string return values (like "POSTPROCESSING_ERROR", "SKIP", etc.)
+                logger.info(f"Audio download attempt returned string result: {result}")
+                if result == "POSTPROCESSING_ERROR":
+                    # Try again with safe filename
+                    logger.info("Audio download failed with postprocessing error, retrying with safe filename")
+                    
+                    # Create a simple retry with safe filename by modifying the ytdl_opts
+                    # We'll create a new ytdl_opts with safe filename and retry
+                    try:
+                        # Get the same options as in try_download_audio but with safe filename
+                        download_format = _audio_format_fallback or format_override or 'ba'
+                        from COMMANDS.args_cmd import get_user_ytdlp_args
+                        user_args = get_user_ytdlp_args(user_id, url)
+                        audio_format = user_args.get('audio_format', 'mp3')
+                        if audio_format == 'best':
+                            audio_format = 'mp3'
+                        
+                        is_hls = ("m3u8" in url.lower())
+                        
+                        ytdl_opts = {
+                           'format': download_format,
+                           'postprocessors': [{
+                              'key': 'FFmpegExtractAudio',
+                              'preferredcodec': audio_format,
+                              'preferredquality': '192',
+                           },
+                           {
+                              'key': 'FFmpegMetadata'
+                           }],
+                           'prefer_ffmpeg': True,
+                           'extractaudio': True,
+                           # Для обратного порядка используем формат START:STOP:-1, иначе просто номер
+                          'playlist_items': f"{playlist_item_index}:{playlist_item_index}:-1" if is_reverse_order and is_playlist else str(playlist_item_index),
+                           'outtmpl': safe_outtmpl,  # Use safe filename
+                            'restrictfilenames': False,
+                           'progress_hooks': [progress_hook],
+                           'extractor_args': {
+                              'generic': {'impersonate': ['chrome']}
+                           },
+                           'referer': url,
+                           'geo_bypass': True,
+                           # check_certificate and no_check_certificates are set from user_args (default: check_certificate=False, no_check_certificates=True)
+                           'live_from_start': True if not did_live_from_start_retry else False,
+                           'writesubtitles': False,
+                           'writeautomaticsub': False,
+                           # JS runtime for YouTube n-parameter challenge solving
+                           'js_runtimes': {'node': {}},
+                           # Network resilience
+                            'retries': 5,
+                            'fragment_retries': 10,
+                             'file_access_retries': 3,
+                             'socket_timeout': 60,
+                             'source_address': '0.0.0.0',
+                          }
+
+                        # Prevent yt-dlp from routing non-playlist URLs through playlist/tab
+                        # extractors (issue #377).
+                        if not is_playlist:
+                           ytdl_opts['noplaylist'] = True
+
+                        if not is_no_filter_domain(url):
+                            ytdl_opts['match_filter'] = create_smart_match_filter(user_id=user_id, message=message)
+                        
+                        # Add user's custom yt-dlp arguments
+                        # writethumbnail will be set from user_args if user enabled write_thumbnail
+                        if user_args:
+                            ytdl_opts.update(user_args)
+                        
+                        # Check if we need to use --no-cookies for this domain
+                        if is_no_cookie_domain(url):
+                            ytdl_opts['cookiefile'] = None
+                        else:
+                            ytdl_opts['cookiefile'] = cookie_file
+                        
+                        # Add proxy configuration
+                        from HELPERS.proxy_helper import add_proxy_to_ytdl_opts
+                        ytdl_opts = add_proxy_to_ytdl_opts(ytdl_opts, url, user_id)
+                        
+                        # Add PO token provider for YouTube domains
+                        ytdl_opts = add_pot_to_ytdl_opts(ytdl_opts, url)
+                        
+                        # Try download with safe filename
+                        with yt_dlp.YoutubeDL(ytdl_opts) as ydl:
+                            info_dict = ydl.extract_info(url, download=False)
+                            if "entries" in info_dict:
+                                entries = info_dict["entries"]
+                                if len(entries) > 1:
+                                    actual_index = playlist_item_index - 1
+                                    if 0 <= actual_index < len(entries):
+                                        info_dict = entries[actual_index]
+                                    else:
+                                        raise Exception(f"Audio index {actual_index + 1} out of range (total {len(entries)})")
+                                else:
+                                    info_dict = entries[0]
+                            
+                            # Download with safe filename
+                            ydl.download([url])
+                            
+                            logger.info("Audio download with safe filename succeeded")
+                            # Continue with the rest of the processing
+                            
+                    except Exception as e:
+                        logger.error(f"Audio download with safe filename also failed: {e}")
+                        continue
+                elif result == "SKIP":
+                    # Skip this item and continue with next
+                    continue
+                elif result == "IMG":
+                    # Gallery-dl fallback has been triggered for this specific item
+                    logger.info(f"Gallery-dl fallback triggered for audio item {current_index}, continuing with next item")
+                    continue
+                elif result == "LIVE_STREAM":
+                    # Live stream detected, skip this item
+                    continue
+                else:
+                    # Other string results, skip this attempt
+                    continue
+            else:
+                # result is a dict (info_dict)
+                info_dict = result
+
+            successful_uploads += 1
+
+            # Check if info_dict is None before accessing it
+            if info_dict is None:
+                logger.error("info_dict is None, cannot proceed with audio processing")
+                # Send specific error message if available
+                if error_text and "Postprocessing" in error_text and "Invalid argument" in error_text:
+                    postprocessing_message = (
+                        safe_get_messages(user_id).AUDIO_FILE_PROCESSING_ERROR_INVALID_ARG_MSG +
+                        "**Possible causes:**\n"
+                        "• Corrupted or incomplete download\n"
+                        "• Unsupported audio format or codec\n"
+                        "• File system permissions issue\n"
+                        "• Insufficient disk space\n\n"
+                        "**Solutions:**\n"
+                        "• Try downloading again with different settings\n"
+                        "• Check if you have enough disk space\n"
+                        "• Try a different quality or format\n"
+                        "• If the problem persists, the audio source may be corrupted"
+                    )
+                    send_error_to_user(message, postprocessing_message)
+                else:
+                    send_to_user(message, safe_get_messages(user_id).AUDIO_EXTRACTION_FAILED_MSG)
+                break
+
+            # Get original title for fallback (if MP3 metadata reading fails)
+            original_audio_title = info_dict.get("original_title", info_dict.get("title", "audio"))
+            
+            # File naming is handled by yt-dlp with our custom outtmpl
+
+            dir_path = user_folder
+
+            downloaded_file = None
+            downloaded_abs_path = None
+            
+            # Find the downloaded audio file
+            filename_hints = []
+            meta_filename = info_dict.get('_filename')
+            if meta_filename:
+                filename_hints.append(meta_filename)
+            filepath_hint = info_dict.get('filepath')
+            if filepath_hint:
+                filename_hints.append(filepath_hint)
+            requested_downloads = info_dict.get('requested_downloads') or []
+            for rd in requested_downloads:
+                rd_path = rd.get('filepath') or rd.get('_filename')
+                if rd_path:
+                    filename_hints.append(rd_path)
+            
+            for hint in filename_hints:
+                if hint and os.path.exists(hint):
+                    downloaded_abs_path = os.path.abspath(hint)
+                    downloaded_file = os.path.basename(downloaded_abs_path)
+                    logger.info(f"[AUDIO RANGE] Using yt-dlp reported file path: {downloaded_abs_path}")
+                    break
+            
+            if not downloaded_file:
+                allfiles = os.listdir(user_folder)
+                logger.info(f"All files in user folder: {allfiles}")
+                
+                # Look for files with the user's preferred audio format extension
+                audio_extensions = ['.mp3', '.aac', '.flac', '.m4a', '.opus', '.ogg', '.wav', '.alac', '.ac3']
+                files = [fname for fname in allfiles if any(fname.endswith(ext) for ext in audio_extensions)]
+                logger.info(f"Found audio files: {files}")
+                files.sort()
+                
+                # If no files found with standard audio extensions, try additional formats
+                if not files:
+                    logger.warning(f"No files found with standard audio extensions, trying additional formats")
+                    additional_extensions = ['.mka', '.wma', '.aiff', '.au', '.ra', '.rm', '.3ga', '.amr', '.awb', '.m4b', '.m4p', '.oga', '.spx', '.tta', '.weba']
+                    files = [fname for fname in allfiles if any(fname.endswith(ext) for ext in additional_extensions)]
+                    files.sort()
+                    logger.info(f"Found audio files with additional formats: {files}")
+                
+                if not files:
+                    logger.error(f"No audio files found in {user_folder}. Available files: {allfiles}")
+                    send_error_to_user(message, safe_get_messages(user_id).AUDIO_UNSUPPORTED_FILE_TYPE_MSG.format(index=original_playlist_index))
+                    continue
+
+                downloaded_file = files[0]
+                downloaded_abs_path = os.path.abspath(os.path.join(user_folder, downloaded_file))
+
+            write_logs(message, url, downloaded_file)
+            
+            # File is already sanitized by yt-dlp with our custom outtmpl
+            audio_file = downloaded_abs_path or os.path.join(user_folder, downloaded_file)
+            if not os.path.exists(audio_file):
+                send_to_user(message, safe_get_messages(user_id).AUDIO_FILE_NOT_FOUND_MSG)
+                continue
+            
+            # Check if file is still downloading (.part file)
+            # Check if the file itself ends with .part
+            if audio_file.endswith('.part'):
+                logger.warning(f"Audio file is still downloading (part file): {audio_file}")
+                send_to_user(message, safe_get_messages(user_id).AUDIO_FILE_STILL_DOWNLOADING_MSG)
+                continue
+            
+            # Check if there's a .part file with the same name (yt-dlp creates .part files during download)
+            if os.path.exists(audio_file + '.part'):
+                logger.warning(f"Audio file is still downloading (part file exists): {audio_file}.part")
+                send_to_user(message, safe_get_messages(user_id).AUDIO_FILE_STILL_DOWNLOADING_MSG)
+                continue
+            
+            # Check if there are any .part files in the directory that might be related
+            # This handles cases where yt-dlp hasn't finished renaming the file yet
+            try:
+                dir_files = os.listdir(user_folder)
+                base_name = os.path.splitext(os.path.basename(audio_file))[0]
+                part_files = [f for f in dir_files if f.startswith(base_name) and f.endswith('.part')]
+                if part_files:
+                    logger.warning(f"Found .part files related to audio file: {part_files}")
+                    send_to_user(message, safe_get_messages(user_id).AUDIO_FILE_STILL_DOWNLOADING_MSG)
+                    continue
+            except Exception as part_check_error:
+                logger.debug(f"Error checking for .part files: {part_check_error}")
+            
+            # Check file size - skip empty files (0 bytes)
+            try:
+                file_size = os.path.getsize(audio_file)
+                if file_size == 0:
+                    logger.error(f"Audio file has zero size: {audio_file}")
+                    send_to_user(message, safe_get_messages(user_id).AUDIO_FILE_SIZE_ZERO_MSG.format(index=original_playlist_index))
+                    continue
+            except Exception as size_error:
+                logger.error(f"Error checking audio file size: {size_error}")
+                send_to_user(message, safe_get_messages(user_id).AUDIO_FILE_NOT_FOUND_MSG)
+                continue
+
+            # Apply explicit trimming if download_sections was specified
+            # This ensures trimming even if download_sections didn't work (e.g., for HLS streams)
+            # Always trim if download_sections is specified to guarantee the result
+            if download_sections and audio_file and os.path.exists(audio_file):
+                import re
+                trim_match = re.match(r'\*(\d{2}):(\d{2}):(\d{2})-(\d{2}):(\d{2}):(\d{2})', download_sections)
+                if trim_match:
+                    start_h, start_m, start_s, end_h, end_m, end_s = map(int, trim_match.groups())
+                    start_seconds = start_h * 3600 + start_m * 60 + start_s
+                    end_seconds = end_h * 3600 + end_m * 60 + end_s
+                    expected_duration = end_seconds - start_seconds
+                    
+                    # Check audio duration using ffprobe to verify if trimming is needed
+                    try:
+                        from DOWN_AND_UP.ffmpeg import get_video_info_ffprobe
+                        width, height, audio_duration = get_video_info_ffprobe(audio_file)
+                        audio_duration = float(audio_duration) if audio_duration else 0
+                        
+                        # Always trim if audio is longer than expected (download_sections didn't work)
+                        # Or if audio is significantly different from expected (more than 5 seconds difference)
+                        if audio_duration > expected_duration + 5:  # Allow 5 seconds tolerance
+                            logger.info(f"[TRIM AUDIO] Audio duration ({audio_duration}s) is longer than expected ({expected_duration}s), applying explicit trim")
+                            logger.info(f"[TRIM AUDIO] Trimming audio from {start_seconds}s to {end_seconds}s")
+                            
+                            # Create temporary trimmed file
+                            temp_trimmed_path = audio_file + '.trimmed.tmp'
+                            from DOWN_AND_UP.ffmpeg import ffmpeg_extract_subclip
+                            
+                            if ffmpeg_extract_subclip(audio_file, start_seconds, end_seconds, temp_trimmed_path):
+                                # Replace original with trimmed version
+                                import shutil
+                                shutil.move(temp_trimmed_path, audio_file)
+                                logger.info(f"[TRIM AUDIO] Successfully trimmed audio to {end_seconds - start_seconds}s")
+                            else:
+                                logger.error(f"[TRIM AUDIO] Failed to trim audio, using original file")
+                                # Clean up temp file if it exists
+                                if os.path.exists(temp_trimmed_path):
+                                    try:
+                                        os.remove(temp_trimmed_path)
+                                    except Exception:
+                                        pass
+                        else:
+                            logger.info(f"[TRIM AUDIO] Audio duration ({audio_duration}s) matches expected ({expected_duration}s), trimming may have worked via download_sections")
+                    except Exception as trim_error:
+                        # If we can't check duration, still try to trim to be safe
+                        logger.warning(f"[TRIM AUDIO] Error checking audio duration: {trim_error}, attempting trim anyway")
+                        try:
+                            temp_trimmed_path = audio_file + '.trimmed.tmp'
+                            from DOWN_AND_UP.ffmpeg import ffmpeg_extract_subclip
+                            
+                            if ffmpeg_extract_subclip(audio_file, start_seconds, end_seconds, temp_trimmed_path):
+                                import shutil
+                                shutil.move(temp_trimmed_path, audio_file)
+                                logger.info(f"[TRIM AUDIO] Successfully trimmed audio to {end_seconds - start_seconds}s (duration check failed)")
+                            else:
+                                logger.error(f"[TRIM AUDIO] Failed to trim audio")
+                        except Exception as trim_exec_error:
+                            logger.error(f"[TRIM AUDIO] Error during trim execution: {trim_exec_error}")
+                            logger.error(traceback.format_exc())
+
+            # Embed cover into audio file if thumbnail is available (enabled by default)
+            # Supports MP3, M4A, FLAC, OPUS, OGG — WAV/AC3 are skipped gracefully
+            # Errors during embedding are handled gracefully and won't stop download
+            try:
+                # Check if user disabled embed_thumbnail (default is True)
+                from COMMANDS.args_cmd import get_user_args
+                user_args_local = get_user_args(user_id)
+                embed_thumbnail_enabled = user_args_local.get("embed_thumbnail", True) if user_args_local else True  # Default True
+                write_thumbnail_enabled = user_args_local.get("write_thumbnail", True) if user_args_local else True  # Default True
+                
+                if not embed_thumbnail_enabled:
+                    logger.info(f"User {user_id} has embed_thumbnail disabled, skipping thumbnail embedding")
+                else:
+                    logger.info(f"User {user_id} embed_thumbnail enabled (default), looking for thumbnails for audio file: {audio_file}")
+                    logger.info(f"User folder contents: {os.listdir(user_folder)}")
+                    
+                    # Use pre-downloaded thumbnail if available
+                    cover_path = None
+                    if thumbnail_path and os.path.exists(thumbnail_path):
+                        cover_path = thumbnail_path
+                        logger.info(f"Using pre-downloaded thumbnail: {cover_path}")
+                    else:
+                        # Fallback: look for any thumbnail files (from write_thumbnail)
+                        logger.info("Pre-downloaded thumbnail not found, searching for any thumbnails")
+                        for file in os.listdir(user_folder):
+                            if file.endswith(('.jpg', '.jpeg', '.png', '.webp')) and file != downloaded_file:
+                                thumb_path = os.path.join(user_folder, file)
+                                if os.path.exists(thumb_path):
+                                    cover_path = thumb_path
+                                    logger.info(f"Found thumbnail: {cover_path}")
+                                    break
+                    
+                    # Embed cover if found
+                    if cover_path and os.path.exists(cover_path):
+                        logger.info(f"Embedding cover {cover_path} into {audio_file}")
+                        
+                        # Extract metadata for embedding
+                        original_title = info_dict.get("original_title", info_dict.get("title", ""))
+                        artist = info_dict.get("artist") or info_dict.get("uploader") or info_dict.get("channel", "")
+                        album = info_dict.get("album", "")
+                        
+                        # Remove artist name from title if it's included
+                        title_for_metadata = original_title
+                        if artist and artist in original_title:
+                            # Try common separators between artist and title
+                            separators = [" - ", ": ", " – ", " — ", " | "]
+                            new_title = original_title
+                            for sep in separators:
+                                pattern = f"{artist}{sep}"
+                                if pattern in new_title:
+                                    new_title = new_title.replace(pattern, "").strip()
+                                    break
+                            title_for_metadata = new_title
+                            logger.info(f"Removed artist from title: '{original_title}' -> '{title_for_metadata}'")
+                        
+                        logger.info(f"Metadata - Title: {title_for_metadata}, Artist: {artist}, Album: {album}")
+                        
+                        success = embed_cover_audio(audio_file, cover_path, title=title_for_metadata, artist=artist, album=album)
+                        if success:
+                            logger.info(f"Successfully embedded cover in audio file: {audio_file}")
+                        else:
+                            logger.warning(f"Failed to embed cover in audio file: {audio_file} (continuing without cover)")
+                    else:
+                        logger.info(f"No thumbnail found for audio file: {audio_file} (continuing without cover)")
+                        logger.debug(f"Available files in {user_folder}: {os.listdir(user_folder)}")
+                    
+            except Exception as e:
+                # Don't let thumbnail embedding errors stop the download
+                logger.warning(f"Error embedding cover in audio file {audio_file}: {e} (continuing without cover)")
+                logger.debug(f"Traceback: {traceback.format_exc()}")
+
+            audio_files.append(audio_file)
+
+            # Явная подпись стадии uploading (как у downloading), progress_bar обновит процент
+            _upload_status_text = f"{current_total_process}\n{safe_get_messages(user_id).SENDER_UPLOADING_FILE_MSG}"
+            try:
+                full_bar = "🟩" * 10
+                safe_edit_message_text(user_id, proc_msg_id, safe_get_messages(user_id).AUDIO_UPLOADING_MSG.format(process=current_total_process, bar=full_bar))
+            except Exception as e:
+                logger.error(f"Error updating upload status: {e}")
+
+            # We form a text with tags and a link for audio
+            tags_for_final = tags if isinstance(tags, list) else (tags.split() if isinstance(tags, str) else [])
+            tags_text_final = generate_final_tags(url, tags_for_final, info_dict)
+            tags_block = (tags_text_final.strip() + '\n') if tags_text_final and tags_text_final.strip() else ''
+            bot_name = getattr(Config, 'BOT_NAME', None) or 'bot'
+            bot_mention = f' @{bot_name}' if not bot_name.startswith('@') else f' {bot_name}'
+
+            # Defaults in case metadata reading fails
+            artist = "Unknown Artist"
+            title = original_audio_title or "Unknown Title"
+
+            # Create display title from metadata (artist + title) — works for all formats
+            try:
+                import mutagen
+                audio_metadata = mutagen.File(audio_file, easy=True)
+                if audio_metadata is not None:
+                    _artist_vals = audio_metadata.get('artist')
+                    if _artist_vals:
+                        artist = str(_artist_vals[0])
+                    _title_vals = audio_metadata.get('title')
+                    if _title_vals:
+                        title = str(_title_vals[0])
+
+                display_title = f"{artist} - {title}"
+                logger.info(f"Audio metadata display title: '{display_title}'")
+            except Exception as e:
+                logger.warning(f"Failed to read audio metadata, using original title: {e}")
+                display_title = title
+
+            # Use display title from metadata for caption
+            caption_with_link = f"{display_title}\n{tags_block}[🔗 Audio URL]({url}){bot_mention}"
+
+            # Get audio bitrate/codec via ffprobe for caption suffix
+            audio_codec, audio_bitrate = get_audio_bitrate_codec(audio_file)
+            audio_quality_suffix = format_audio_quality_suffix(audio_codec, audio_bitrate)
+            logger.info(f"Audio quality suffix: '{audio_quality_suffix}' (codec={audio_codec}, bitrate={audio_bitrate})")
+
+            # Trim caption to fit Telegram's 1024 character limit using truncate_caption
+            from HELPERS.caption import truncate_caption
+            title_html, pre_block, blockquote_content, tags_block, link_block, was_truncated = truncate_caption(
+                title=display_title,
+                description="",  # No description for audio
+                url=url,
+                tags_text=tags_text_final,
+                max_length=1000,  # Reduced for safety
+                user_id=user_id,
+                quality_codec_suffix=audio_quality_suffix
+            )
+            # Rebuild caption from truncated parts
+            caption_with_link = ""
+            if title_html:
+                caption_with_link += title_html + "\n"
+            if tags_block:
+                caption_with_link += tags_block
+            caption_with_link += link_block
+            
+            try:
+                # Create Telegram-compliant thumbnail if cover is available
+                telegram_thumb = None
+                if cover_path and os.path.exists(cover_path):
+                    telegram_thumb_path = os.path.join(user_folder, f"telegram_thumb_{idx}.jpg")
+                    if create_telegram_thumbnail(cover_path, telegram_thumb_path):
+                        telegram_thumb = telegram_thumb_path
+                        logger.info(f"Using Telegram thumbnail: {telegram_thumb}")
+                    else:
+                        logger.warning("Failed to create Telegram thumbnail")
+                
+                # Determine if this is NSFW content in private chat (paid media)
+                from HELPERS.porn import is_porn
+                is_nsfw = is_porn(url, "", "", None) or user_forced_nsfw
+                logger.info(f"[FALLBACK] is_porn check for {url}: {is_porn(url, '', '', None)}, user_forced_nsfw: {user_forced_nsfw}, final is_nsfw: {is_nsfw}")
+                is_private_chat = getattr(message.chat, "type", None) == enums.ChatType.PRIVATE
+                # Для логирования используем is_nsfw and is_private_chat (без учета админа)
+                # чтобы логирование оставалось как для всех остальных
+                is_paid_for_logging = is_nsfw and is_private_chat
+                # Для отправки пользователю проверяем админа
+                from HELPERS.limitter import should_apply_limits_to_admin
+                is_paid_for_user = is_paid_for_logging and should_apply_limits_to_admin(user_id=user_id, message=message)
+                
+                # Determine file extension to decide how to send it
+                file_ext = os.path.splitext(audio_file)[1].lower()
+                
+                # Send audio with appropriate method based on content type and file format
+                # Используем is_paid_for_user для отправки (админы получают открытый контент)
+                if is_paid_for_user:
+                    # Telegram sendPaidMedia API does not support audio type (only photo/video).
+                    # NSFW audio is sent free via send_audio — BUT we must NEVER fallback to
+                    # sending video-capable formats (.mp4, .webm, etc.) to prevent free NSFW
+                    # video leaks through the audio download path. Only pure audio is allowed.
+                    _audio_only_exts = ('.mp3', '.m4a', '.aac', '.flac', '.opus', '.ogg', '.wav', '.alac', '.ac3')
+
+                    if file_ext not in _audio_only_exts:
+                        # File is not pure audio (e.g. .mp4/.webm from worstvideo fallback).
+                        # Must convert to audio before sending — otherwise this is a free video leak.
+                        from DOWN_AND_UP.ffmpeg import get_ffmpeg_path, normalize_path_for_ffmpeg
+                        _ffmpeg_bin = get_ffmpeg_path()
+                        if not _ffmpeg_bin:
+                            logger.error(f"NSFW audio conversion failed: ffmpeg not found, file={audio_file}")
+                            send_error_to_user(message, safe_get_messages(user_id).ERROR_SENDING_VIDEO_MSG.format(error="ffmpeg not found for audio conversion"))
+                            raise RuntimeError("ffmpeg not found for NSFW audio conversion")
+
+                        _converted_audio = audio_file + '.nsfw_conv.mp3'
+                        _src = normalize_path_for_ffmpeg(audio_file)
+                        _dst = normalize_path_for_ffmpeg(_converted_audio)
+                        _conv_cmd = [_ffmpeg_bin, '-y', '-i', _src, '-vn', '-acodec', 'libmp3lame', '-q:a', '2', _dst]
+                        logger.info(f"Converting NSFW non-audio file to mp3: {audio_file} -> {_converted_audio}")
+                        try:
+                            _conv_result = subprocess.run(_conv_cmd, capture_output=True, text=True, timeout=300)
+                            if _conv_result.returncode != 0:
+                                logger.error(f"NSFW audio conversion failed (rc={_conv_result.returncode}): {_conv_result.stderr[:500]}")
+                                raise RuntimeError(f"ffmpeg conversion failed: {_conv_result.stderr[:200]}")
+                            if not os.path.exists(_converted_audio) or os.path.getsize(_converted_audio) == 0:
+                                logger.error(f"NSFW audio conversion produced empty/missing file: {_converted_audio}")
+                                raise RuntimeError("Converted audio file is empty or missing")
+                            audio_file = _converted_audio
+                            file_ext = '.mp3'
+                            logger.info(f"NSFW audio conversion successful: {_converted_audio}")
+                        except Exception as _conv_err:
+                            logger.error(f"NSFW audio conversion error, NOT sending (prevents free video leak): {_conv_err}")
+                            send_error_to_user(message, safe_get_messages(user_id).ERROR_SENDING_VIDEO_MSG.format(error=str(_conv_err)))
+                            raise
+
+                    # At this point audio_file is guaranteed to be a pure audio format
+                    if proc_msg_id:
+                        _start_upload_logging(user_id, proc_msg_id)
+                    try:
+                        _prog_args = (user_id, proc_msg_id, _upload_status_text) if proc_msg_id else None
+                        if telegram_thumb and os.path.exists(telegram_thumb):
+                            audio_msg = timed_upload(lambda: app.send_audio(
+                                chat_id=user_id,
+                                audio=audio_file,
+                                caption=caption_with_link,
+                                reply_parameters=ReplyParameters(message_id=message.id),
+                                thumb=telegram_thumb,
+                                title=title,
+                                performer=artist,
+                                progress=progress_bar if _prog_args else None,
+                                progress_args=_prog_args,
+                            ))
+                        else:
+                            audio_msg = timed_upload(lambda: app.send_audio(
+                                chat_id=user_id,
+                                audio=audio_file,
+                                caption=caption_with_link,
+                                reply_parameters=ReplyParameters(message_id=message.id),
+                                title=title,
+                                performer=artist,
+                                progress=progress_bar if _prog_args else None,
+                                progress_args=_prog_args,
+                            ))
+                        logger.info("NSFW audio sent (paid media not supported for audio type)")
+                    finally:
+                        if proc_msg_id:
+                            _stop_upload_logging(user_id, proc_msg_id)
+                else:
+                    # Send regular audio for non-NSFW content or group chats
+                    # Start upload logging to prevent watchdog false positives
+                    if proc_msg_id:
+                        _start_upload_logging(user_id, proc_msg_id)
+                    try:
+                        _prog_args = (user_id, proc_msg_id, _upload_status_text) if proc_msg_id else None
+                        if file_ext in ('.mp3', '.m4a', '.opus', '.ogg'):
+                            # Send as audio (Telegram player supports MP3, M4A, OGG/OPUS)
+                            if telegram_thumb and os.path.exists(telegram_thumb):
+                                audio_msg = timed_upload(lambda: app.send_audio(
+                                    chat_id=user_id, 
+                                    audio=audio_file, 
+                                    caption=caption_with_link, 
+                                    reply_parameters=ReplyParameters(message_id=message.id),
+                                    thumb=telegram_thumb,
+                                    title=title,
+                                    performer=artist,
+                                    progress=progress_bar if _prog_args else None,
+                                    progress_args=_prog_args,
+                                ))
+                                logger.info(f"Audio sent with Telegram thumbnail: {telegram_thumb}")
+                            else:
+                                audio_msg = timed_upload(lambda: app.send_audio(
+                                    chat_id=user_id, 
+                                    audio=audio_file, 
+                                    caption=caption_with_link, 
+                                    reply_parameters=ReplyParameters(message_id=message.id),
+                                    title=title,
+                                    performer=artist,
+                                    progress=progress_bar if _prog_args else None,
+                                    progress_args=_prog_args,
+                                ))
+                                logger.info("Audio sent without thumbnail")
+                        else:
+                            # Send as document for unsupported audio formats
+                            audio_msg = timed_upload(lambda: app.send_document(
+                                chat_id=user_id, 
+                                document=audio_file, 
+                                caption=caption_with_link, 
+                                reply_parameters=ReplyParameters(message_id=message.id),
+                                progress=progress_bar if _prog_args else None,
+                                progress_args=_prog_args,
+                            ))
+                            logger.info(f"Audio sent as document (format: {file_ext})")
+                    finally:
+                        # Stop upload logging after upload completes or fails
+                        if proc_msg_id:
+                            _stop_upload_logging(user_id, proc_msg_id)
+                
+                # Use already determined content type
+                
+                # Handle different content types according to new logic
+                # Используем is_paid_for_logging для логирования (чтобы логирование было как для всех)
+                if is_paid_for_logging:
+                    # For NSFW content in private chat, paid audio already sent to user (if is_paid_for_user)
+                    # We need to send paid copy to LOGS_PAID_ID and open copy to LOGS_NSFW_ID for history
+                    
+                    # Send paid copy to LOGS_PAID_ID
+                    log_channel_paid = get_log_channel("video", paid=True)
+                    try:
+                        # Forward the paid audio to LOGS_PAID_ID
+                        safe_forward_messages(log_channel_paid, user_id, [audio_msg.id])
+                        logger.info(f"down_and_audio: NSFW audio paid copy sent to PAID channel")
+                    except Exception as e:
+                        logger.error(f"down_and_audio: failed to send paid copy to PAID channel: {e}")
+                    
+                    # Send open copy to LOGS_NSWF_ID for history
+                    log_channel_nsfw = get_log_channel("video", nsfw=True)
+                    try:
+                        # Create open copy for history (without stars)
+                        # NOTE: no reply_parameters — message.id is from user chat and does not exist in log channel
+                        open_audio_msg = timed_upload(lambda: app.send_audio(
+                            chat_id=log_channel_nsfw,
+                            audio=audio_file,
+                            caption=caption_with_link,
+                            thumb=telegram_thumb if telegram_thumb and os.path.exists(telegram_thumb) else None,
+                            title=title,
+                            performer=artist,
+                        ))
+                        logger.info(f"down_and_audio: NSFW audio open copy sent to NSFW channel for history (channel={log_channel_nsfw})")
+                    except Exception as e:
+                        logger.error(f"down_and_audio: failed to send open copy to NSFW channel (channel={log_channel_nsfw}, file={audio_file}): {e}")
+                    
+                    # Don't cache NSFW content
+                    logger.info(f"down_and_audio: NSFW audio sent to user (paid), PAID channel (paid copy), and NSFW channel (open copy), not cached")
+                    forwarded_msg = None
+                    
+                elif is_nsfw:
+                    # NSFW content in groups -> LOGS_NSWF_ID only
+                    log_channel = get_log_channel("video", nsfw=True)
+                    forwarded_msg = safe_forward_messages(log_channel, user_id, [audio_msg.id])
+                    # Don't cache NSFW content
+                    logger.info(f"down_and_audio: NSFW audio sent to NSFW channel, not cached")
+                    forwarded_msg = None
+                else:
+                    # Regular content -> LOGS_VIDEO_ID and cache
+                    log_channel = get_log_channel("video")
+                    forwarded_msg = safe_forward_messages(log_channel, user_id, [audio_msg.id])
+                
+                # Save to cache after sending audio (only for non-NSFW content and if no active functions)
+                # Check active functions (TRIM, SUBS, DUBS) - disable cache if any are active
+                from DOWN_AND_UP.always_ask_menu import get_active_functions
+                active_funcs = get_active_functions(user_id, url)
+                should_disable_cache = active_funcs["should_disable_cache"]
+                
+                if quality_key and forwarded_msg and not is_nsfw and not should_disable_cache:
+                    if isinstance(forwarded_msg, list):
+                        msg_ids = [m.id for m in forwarded_msg]
+                    else:
+                        msg_ids = [forwarded_msg.id]
+                    
+                    # Check if cache should be disabled due to active functions (TRIM/SUBS/DUBS)
+                    if should_disable_cache:
+                        logger.info(f"[AUDIO CACHE] Skipping cache save because active functions detected. TRIM: {active_funcs['has_trim']}, SUBS: {active_funcs['has_subs']}, DUBS: {active_funcs['has_dubs']}")
+                    elif is_playlist:
+                        # For playlists, save to playlist cache with index
+                        current_video_index = original_playlist_index
+                        logger.info(f"down_and_audio: saving to playlist cache: index={current_video_index}, msg_ids={msg_ids}")
+                        save_to_playlist_cache(get_clean_playlist_url(url), quality_key, [current_video_index], msg_ids, original_text=message.text or message.caption or "", video_urls_dict=None)
+                        cached_check = get_cached_playlist_videos(get_clean_playlist_url(url), quality_key, [current_video_index])
+                        logger.info(f"Checking the cache immediately after writing: {cached_check}")
+                        playlist_indices.append(current_video_index)
+                        playlist_msg_ids.extend(msg_ids)  # We use msg_ids instead of forwarded_msgs
+                    else:
+                        # For single audios, save to regular cache
+                        logger.info(f"down_and_audio: saving to video cache: msg_ids={msg_ids}")
+                        save_to_video_cache(url, quality_key, msg_ids, original_text=message.text or message.caption or "", user_id=user_id)
+                elif is_nsfw:
+                    logger.info(f"down_and_audio: skipping cache for NSFW content (url={url})")
+            except Exception as send_error:
+                logger.error(f"Error sending audio: {send_error}")
+                send_to_user(message, safe_get_messages(user_id).AUDIO_SEND_FAILED_MSG.format(error=send_error))
+                continue
+
+            # Clean up the audio file after sending
+            try:
+                send_mediainfo_if_enabled(user_id, audio_file, message)
+                os.remove(audio_file)
+            except Exception as e:
+                logger.error(f"Failed to delete audio file {audio_file}: {e}")
+
+            # Add delay between uploads for playlists
+            if idx and idx < len(indices_to_download) - 1:
+                pass
+
+        if successful_uploads == len(indices_to_download):
+            success_msg = f"{safe_get_messages(user_id).AUDIO_SUCCESSFULLY_COMPLETED_MSG.format(total_files=len(indices_to_download))}\n{safe_get_messages(user_id).CREDITS_MSG}"
+        else:
+            success_msg = f"{safe_get_messages(user_id).AUDIO_PARTIALLY_COMPLETED_MSG.format(successful_uploads=successful_uploads, total_files=len(indices_to_download))}\n{safe_get_messages(user_id).CREDITS_MSG}"
+            
+        try:
+            safe_edit_message_text(user_id, proc_msg_id, success_msg)
+        except Exception as e:
+            logger.error(f"Error updating final status: {e}")
+
+        send_to_logger(message, success_msg)
+        
+        # Send playlist range hint if auto-range was added
+        try:
+            if auto_range_added:
+                hint_msg = safe_get_messages(user_id).PLAYLIST_AUTO_RANGE_HINT_MSG
+                safe_send_message(user_id, hint_msg, reply_parameters=ReplyParameters(message_id=message.id))
+                logger.info(f"Sent playlist auto-range hint to user {user_id}")
+        except Exception as hint_error:
+            logger.error(f"Error sending playlist auto-range hint: {hint_error}")
+        
+        # Clean up download subdirectory after successful upload
+        try:
+            from DOWN_AND_UP.always_ask_menu import get_user_download_dir
+            download_dir = get_user_download_dir(user_id)
+            if download_dir and os.path.exists(download_dir):
+                logger.info(f"Cleaning up download subdirectory after successful audio upload: {download_dir}")
+                import shutil
+                shutil.rmtree(download_dir)
+                logger.info(f"Successfully removed download subdirectory: {download_dir}")
+        except Exception as cleanup_error:
+            logger.error(f"Error cleaning up download subdirectory for user {user_id}: {cleanup_error}")
+
+        if is_playlist and quality_key:
+            total_sent = len(cached_videos) + successful_uploads
+            app.send_message(user_id, safe_get_messages(user_id).PLAYLIST_SENT_MSG.format(sent=total_sent, total=len(requested_indices)), reply_parameters=ReplyParameters(message_id=message.id))
+            send_to_logger(message, safe_get_messages(user_id).PLAYLIST_AUDIO_SENT_LOG_MSG.format(sent=total_sent, total=len(requested_indices), quality=quality_key, user_id=user_id))
+
+    except Exception as e:
+        if "Download timeout exceeded" in str(e):
+            send_to_user(message, safe_get_messages(user_id).DOWNLOAD_TIMEOUT_MSG)
+            log_error_to_channel(message, LoggerMsg.DOWNLOAD_TIMEOUT_LOG, url)
+        else:
+            logger.error(f"Error in audio download: {e}")
+            send_to_user(message, safe_get_messages(user_id).AUDIO_DOWNLOAD_FAILED_MSG.format(error=str(e)))
+        # Immediate cleanup on error
+        try:
+            if status_msg_id:
+                safe_delete_messages(chat_id=user_id, message_ids=[status_msg_id], revoke=True)
+            if hourglass_msg_id:
+                safe_delete_messages(chat_id=user_id, message_ids=[hourglass_msg_id], revoke=True)
+            if download_started_msg_id:
+                safe_delete_messages(chat_id=user_id, message_ids=[download_started_msg_id], revoke=True)
+            stop_anim.set()
+        except Exception:
+            pass
+    finally:
+        # Always unregister cancel event to prevent memory leaks
+        try:
+            unregister_download_cancel_event(user_id, _cancel_ev)
+        except Exception:
+            pass
+        # Always clean up resources
+        stop_anim.set()
+        if anim_thread:
+            anim_thread.join(timeout=1)  # Wait for animation thread with timeout
+
+        try:
+            if status_msg_id:
+                safe_delete_messages(chat_id=user_id, message_ids=[status_msg_id], revoke=True)
+            if hourglass_msg_id:
+                safe_delete_messages(chat_id=user_id, message_ids=[hourglass_msg_id], revoke=True)
+        except Exception as e:
+            logger.error(f"Error deleting status messages: {e}")
+
+        # Clean up any remaining audio files
+        for audio_file in audio_files:
+            try:
+                if os.path.exists(audio_file):
+                    os.remove(audio_file)
+            except Exception as e:
+                logger.error(f"Failed to delete file {audio_file}: {e}")
+        
+        # Clean up any downloaded thumbnails
+        try:
+            # Use the unique download directory for cleanup
+            if os.path.exists(user_folder):
+                # Clean up YouTube thumbnails
+                for thumb_file in os.listdir(user_folder):
+                    if thumb_file.startswith("yt_thumb_") and thumb_file.endswith(".jpg"):
+                        try:
+                            os.remove(os.path.join(user_folder, thumb_file))
+                        except Exception as e:
+                            logger.error(f"Failed to delete thumbnail {thumb_file}: {e}")
+                
+                # Clean up universal thumbnails
+                universal_thumb = os.path.join(user_folder, "universal_thumb.jpg")
+                if os.path.exists(universal_thumb):
+                    try:
+                        os.remove(universal_thumb)
+                    except Exception as e:
+                        logger.error(f"Failed to delete universal thumbnail: {e}")
+                
+                # Clean up any yt-dlp generated thumbnails
+                for thumb_file in os.listdir(user_folder):
+                    if thumb_file.endswith(('.jpg', '.jpeg', '.png', '.webp')) and not thumb_file.startswith("yt_thumb_"):
+                        try:
+                            os.remove(os.path.join(user_folder, thumb_file))
+                        except Exception as e:
+                            logger.error(f"Failed to delete thumbnail {thumb_file}: {e}")
+                
+                # Clean up Telegram thumbnails
+                for thumb_file in os.listdir(user_folder):
+                    if thumb_file.startswith("telegram_thumb_") and thumb_file.endswith(".jpg"):
+                        try:
+                            os.remove(os.path.join(user_folder, thumb_file))
+                        except Exception as e:
+                            logger.error(f"Failed to delete Telegram thumbnail {thumb_file}: {e}")
+        except Exception as e:
+            logger.error(f"Error cleaning up thumbnails: {e}")
+
+        set_active_download(user_id, False)
+        clear_download_start_time(user_id)  # Cleaning the start time
+
+        # Clean up temporary files
+        try:
+            cleanup_user_temp_files(user_id)
+        except Exception as e:
+            logger.error(f"Error cleaning up temp files for user {user_id}: {e}")
+
+        # Reset playlist errors if this was a playlist
+        if playlist_name:
+            with playlist_errors_lock:
+                error_key = f"{user_id}_{playlist_name}"
+                if error_key in playlist_errors:
+                    del playlist_errors[error_key]
+        
+        # Clear Always Ask menu states (TRIM, SUBS, DUBS) at the end of function
+        # This ensures states are cleared after all operations are complete
+        try:
+            from DOWN_AND_UP.always_ask_menu import clear_all_ask_menu_states
+            clear_all_ask_menu_states(user_id)
+        except Exception as e:
+            logger.error(f"Failed to clear Always Ask menu states at end of down_and_audio: {e}")
