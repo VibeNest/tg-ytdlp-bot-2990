@@ -1,5 +1,7 @@
 # Limits Configuration
 
+import os
+
 class LimitsConfig(object):
     #######################################################
     # Limits and restrictions
@@ -65,16 +67,87 @@ class LimitsConfig(object):
     YTDLP_SOCKET_TIMEOUT = 60
 
     @staticmethod
+    @staticmethod
+    def _container_cpu_count():
+        """تعداد CPU مؤثرِ کانتینر (cgroup v1/v2).
+
+        os.cpu_count() روی Railway/داکر عددِ «هاست» را برمی‌گرداند (مثلاً ۳۲) و
+        باعث ساخت ورکرهای بیش‌از‌حد و پر شدن رم می‌شود؛ این تابع سهمیهٔ واقعی
+        کانتینر را می‌خواند.
+        """
+        try:  # cgroup v2
+            with open("/sys/fs/cgroup/cpu.max", "r") as handle:
+                parts = handle.read().split()
+            if len(parts) == 2 and parts[0] != "max":
+                quota, period = float(parts[0]), float(parts[1] or 100000)
+                if quota > 0 and period > 0:
+                    return max(1, int(round(quota / period)))
+        except Exception:
+            pass
+        try:  # cgroup v1
+            quota = int(open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r").read().strip())
+            period = int(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r").read().strip())
+            if quota > 0 and period > 0:
+                return max(1, int(round(quota / period)))
+        except Exception:
+            pass
+        try:  # cpuset
+            raw = open("/sys/fs/cgroup/cpuset.cpus.effective", "r").read().strip()
+            total = 0
+            for chunk in raw.split(","):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                if "-" in chunk:
+                    low, high = chunk.split("-", 1)
+                    total += int(high) - int(low) + 1
+                else:
+                    total += 1
+            if total > 0:
+                return total
+        except Exception:
+            pass
+        return 0
+
+    @staticmethod
+    def _container_mem_mb():
+        """رمِ قابل‌استفادهٔ کانتینر به مگابایت (۰ = نامعلوم)."""
+        for path in ("/sys/fs/cgroup/memory.max",
+                     "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+            try:
+                raw = open(path, "r").read().strip()
+                if raw and raw != "max":
+                    value = int(raw)
+                    if 0 < value < (1 << 60):
+                        return value // (1024 * 1024)
+            except Exception:
+                continue
+        return 0
+
+    @staticmethod
     def detect_system_resources():
-        """Detect system resources and return recommended worker counts."""
+        """منابع سیستم/کانتینر + تعداد ورکرها و آپلودهای پیشنهادی."""
         import os
         try:
-            cpu_count = os.cpu_count() or 2
+            cpu_count = LimitsConfig._container_cpu_count() or (os.cpu_count() or 2)
         except Exception:
             cpu_count = 2
+        mem_mb = LimitsConfig._container_mem_mb()
 
         bg_workers = min(cpu_count * 5, 48)
         max_uploads = min(cpu_count, 8)
+        # کانتینر کم‌رم ⇒ ورکر و آپلود کمتر تا OOM نشود
+        if mem_mb:
+            if mem_mb <= 1024:
+                bg_workers = min(bg_workers, 6)
+                max_uploads = min(max_uploads, 1)
+            elif mem_mb <= 2048:
+                bg_workers = min(bg_workers, 12)
+                max_uploads = min(max_uploads, 2)
+            elif mem_mb <= 4096:
+                bg_workers = min(bg_workers, 24)
+                max_uploads = min(max_uploads, 4)
+
         inflight = bg_workers * 10
 
         return {
@@ -82,6 +155,7 @@ class LimitsConfig(object):
             'max_uploads': max_uploads,
             'inflight': inflight,
             'cpu_count': cpu_count,
+            'mem_mb': mem_mb,
         }
 
     @classmethod
@@ -247,3 +321,33 @@ class LimitsConfig(object):
     AUTO_PROXY_MAX_TIME = 300      # 5 minutes total
     AUTO_PROXY_MAX_ATTEMPTS = 100  # max proxy attempts
     AUTO_PROXY_CACHE_TTL = 300     # cache working proxy for 5 minutes
+    #######################################################
+    # متغیرهای محیطی (Railway) — بر مقادیر بالای همین کلاس اولویت دارند
+    # Environment overrides — set them in Railway → Variables
+    #######################################################
+    from CONFIG.envguard import i as _env_i, b as _env_b
+
+    TURN_OFF_LIMITS_FOR_ADMINS = _env_b("TURN_OFF_LIMITS_FOR_ADMINS", TURN_OFF_LIMITS_FOR_ADMINS)
+    MAX_FILE_SIZE_GB = _env_i("MAX_FILE_SIZE_GB", MAX_FILE_SIZE_GB, minimum=1, maximum=100)
+    DOWNLOAD_TIMEOUT = _env_i("DOWNLOAD_TIMEOUT", DOWNLOAD_TIMEOUT, minimum=60)
+    MAX_CONCURRENT_DOWNLOADS = _env_i("MAX_CONCURRENT_DOWNLOADS", MAX_CONCURRENT_DOWNLOADS, minimum=1, maximum=20)
+    MAX_SUB_QUALITY = _env_i("MAX_SUB_QUALITY", MAX_SUB_QUALITY)
+    MAX_SUB_DURATION = _env_i("MAX_SUB_DURATION", MAX_SUB_DURATION)
+    MAX_SUB_SIZE = _env_i("MAX_SUB_SIZE", MAX_SUB_SIZE)
+    MAX_PLAYLIST_COUNT = _env_i("MAX_PLAYLIST_COUNT", MAX_PLAYLIST_COUNT, minimum=1)
+    MAX_TIKTOK_COUNT = _env_i("MAX_TIKTOK_COUNT", MAX_TIKTOK_COUNT, minimum=1)
+    MAX_IMG_FILES = _env_i("MAX_IMG_FILES", MAX_IMG_FILES, minimum=1)
+    MAX_VIDEO_DURATION = _env_i("MAX_VIDEO_DURATION", MAX_VIDEO_DURATION, minimum=1)
+    GROUP_MULTIPLIER = _env_i("GROUP_MULTIPLIER", GROUP_MULTIPLIER, minimum=1)
+    NSFW_STAR_COST = _env_i("NSFW_STAR_COST", NSFW_STAR_COST)
+    RATE_LIMIT_PER_MINUTE = _env_i("RATE_LIMIT_PER_MINUTE", RATE_LIMIT_PER_MINUTE)
+    RATE_LIMIT_PER_HOUR = _env_i("RATE_LIMIT_PER_HOUR", RATE_LIMIT_PER_HOUR)
+    RATE_LIMIT_PER_DAY = _env_i("RATE_LIMIT_PER_DAY", RATE_LIMIT_PER_DAY)
+    COMMAND_LIMIT_PER_MINUTE = _env_i("COMMAND_LIMIT_PER_MINUTE", COMMAND_LIMIT_PER_MINUTE)
+    UPLOAD_TIMEOUT_SECONDS = _env_i("UPLOAD_TIMEOUT_SECONDS", UPLOAD_TIMEOUT_SECONDS, minimum=60)
+    YTDLP_SOCKET_TIMEOUT = _env_i("YTDLP_SOCKET_TIMEOUT", YTDLP_SOCKET_TIMEOUT, minimum=10)
+    ENABLE_LIVE_STREAM_BLOCKING = _env_b("ENABLE_LIVE_STREAM_BLOCKING", ENABLE_LIVE_STREAM_BLOCKING)
+    MAX_LIVE_STREAM_DURATION = _env_i("MAX_LIVE_STREAM_DURATION", MAX_LIVE_STREAM_DURATION, minimum=60)
+    if os.environ.get("MAX_CONCURRENT_UPLOADS", "").strip():
+        MAX_CONCURRENT_UPLOADS = _env_i("MAX_CONCURRENT_UPLOADS", 0)
+    #######################################################
