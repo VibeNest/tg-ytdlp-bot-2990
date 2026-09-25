@@ -59,11 +59,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgif7 \
         librsvg2-2 \
         libpixman-1-0 \
-    && git clone --depth 1 https://github.com/aliftype/amiri.git /tmp/amiri 2>/dev/null \
     && mkdir -p /usr/share/fonts/truetype/amiri \
-    && cp /tmp/amiri/fonts/*.ttf /usr/share/fonts/truetype/amiri/ 2>/dev/null \
+    && for font in Amiri-Regular Amiri-Bold Amiri-Italic; do \
+           curl -fsSL -o "/usr/share/fonts/truetype/amiri/$font.ttf" \
+             "https://raw.githubusercontent.com/aliftype/amiri/main/fonts/$font.ttf" || true; \
+       done \
     && fc-cache -f >/dev/null 2>&1 \
-    && rm -rf /tmp/amiri \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
