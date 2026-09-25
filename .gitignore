@@ -152,12 +152,12 @@ channel_guard_session_string.txt
 channel_guard_user_session.session
 
 # Configs with secrets (do not commit)
-CONFIG/config.py
+# CONFIG/config.py — این نسخه env-محور است و باید در ریپو بماند (Railway)
 NEWCODE
 NEWCODE/
 _old/
 #CONFIG/domains.py
-config.py
+# config.py (نسخهٔ شخصیِ قدیمی — در این ریپو لازم نیست)
 TXT/porn_domains.txt
 TXT/porn_keywords.txt
 TXT/porn_keywords.txt.removal_report.txt
